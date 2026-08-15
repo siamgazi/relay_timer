@@ -7,11 +7,16 @@
 // One bus, two speeds, three protocols:
 //
 //   Pentair  (slot addr 0x60+n) — proprietary framing, 9600 baud.
-//             CONFIRMED: every command waits for a checksum-valid reply,
-//             and needs a one-time "take control" handshake first.
+//             CONFIRMED: every command waits for a checksum-valid reply
+//             (after a one-time "take control" handshake), and the state
+//             flag only flips once a status readback (cmd 0x07) reports
+//             the commanded speed/stop.
 //   Emaux    (slot addr = slot) — Modbus RTU FC06, 9600 baud.
-//             CONFIRMED: the write echo is required before the state
-//             flag flips.
+//             CONFIRMED: the write echo is required, then the pump's
+//             input registers are read back until they report the
+//             commanded state (a pump can echo a speed write yet start
+//             at its panel-set speed — the readback catches that and
+//             triggers a re-send).
 //   B&D      (fixed addr 1, pump slot 1 ONLY) — Modbus RTU FC06, 38400.
 //             FIRE-AND-FORGET by design: one setpoint write (speed to
 //             run, 0 to stop), NO reply is awaited and RX is never
@@ -75,12 +80,23 @@ inline void dbgHexDump(const uint8_t *buf, uint8_t len) {
 #define INTERCHAR_TIMEOUT_MS  15   // max gap between reply bytes
 #define RS485_BAUD_SETTLE_MS  500  // spec: settle after every baud change
 
+// ---- Closed-loop verification (Pentair + Emaux) ------------
+// After a command is echoed OK, the pump's OWN status is polled until it
+// reports the commanded state: ON = reported speed within tolerance of
+// the target, OFF = reported stopped. Until the readback matches, the
+// command is re-sent periodically (the app's flow: speed -> start ->
+// status; if the status doesn't show the speed, send the speed again).
+#define VERIFY_POLL_MS    1000  // status readback cadence while unverified
+#define VERIFY_RESEND_MS  5000  // re-send the command if still not matching
+#define VERIFY_RPM_TOL    50    // regulation jitter allowance on the readback
+
 // ---- Pentair IntelliFlo VS/VF (proprietary RS485) ----------
 #define PENTAIR_CTRL_ADDR     0x10  // us, the automation controller
 #define PENTAIR_BASE_ADDR     0x60  // slot 1 = 0x60, slot 2 = 0x61, ...
 #define PENTAIR_CMD_SPEED     0x01
 #define PENTAIR_CMD_CONTROL   0x04  // one-time "take control" handshake
 #define PENTAIR_CMD_RUN       0x06
+#define PENTAIR_CMD_STATUS    0x07  // readback: run state + current RPM
 #define PENTAIR_RUN           0x0A
 #define PENTAIR_STOP          0x04
 #define PENTAIR_RPM_MIN       450
@@ -88,9 +104,12 @@ inline void dbgHexDump(const uint8_t *buf, uint8_t len) {
 #define PENTAIR_CONTROL_RETRY_MS 3000
 
 // ---- Emaux (Modbus RTU FC06) -------------------------------
-#define EMAUX_FC_WRITE     0x06
-#define EMAUX_REG_RUN      0x0008
-#define EMAUX_REG_SPEED    0x0009
+#define EMAUX_FC_WRITE       0x06
+#define EMAUX_FC_READ_INPUT  0x04
+#define EMAUX_REG_RUN        0x0008
+#define EMAUX_REG_SPEED      0x0009
+#define EMAUX_REG_CUR_SPEED  0x0001  // input reg: current speed (RPM)
+#define EMAUX_REG_RUN_STATUS 0x0003  // input reg: 1 = running, 0 = stopped
 #define EMAUX_RUN_CMD      1
 #define EMAUX_STOP_CMD     2
 #define EMAUX_RPM_MIN      800
@@ -134,6 +153,18 @@ struct PumpLogMemo {
     bool     failLogged = false;
 };
 PumpLogMemo pumpLogMemo[MAX_PUMPS];
+
+// Closed-loop bookkeeping (Pentair/Emaux): a command is only "applied"
+// once the pump's own status readback matches it.
+struct PumpVerify {
+    bool     awaiting = false;     // echoed command awaiting a matching readback
+    bool     everSent = false;     // first send of the current goal already logged
+    bool     pollLogged = false;   // first status poll already logged
+    bool     resendLogged = false;
+    uint32_t lastSendMs = 0;
+    uint32_t lastPollMs = 0;
+};
+PumpVerify pumpVerify[MAX_PUMPS];
 
 // ---- Bus lifecycle -----------------------------------------
 uint32_t rs485CurrentBaud = RS485_BAUD;
@@ -349,6 +380,29 @@ inline bool pentairRun(uint8_t pumpId, bool run) {
     return pentairSendCmd(pumpId, PENTAIR_CMD_RUN, data, 1);
 }
 
+// Status readback: payload is [run mode drivestate watts_hi watts_lo
+// rpm_hi rpm_lo ...] — run==0x0A means running.
+inline bool pentairReadStatus(uint8_t pumpId, bool &running, uint16_t &rpm) {
+    rs485UseBaud(RS485_BAUD);
+    uint8_t frame[32];
+    uint8_t flen = pentairBuildPacket(frame, pentairBusAddress(pumpId), PENTAIR_CMD_STATUS, nullptr, 0);
+    rs485Send(frame, flen);
+    uint8_t resp[48];
+    uint8_t rlen = rs485Receive(resp, sizeof(resp), PENTAIR_TIMEOUT_MS);
+    if (rlen == 0 || !pentairValidateResponse(resp, rlen)) return false;
+    int16_t sof = -1;
+    for (uint8_t i = 0; i < rlen; i++) {
+        if (resp[i] == 0xA5) { sof = i; break; }
+    }
+    uint8_t dataLen = resp[sof + 5];
+    if (dataLen < 7) { DBG_PRINTLN("[Pentair] status payload too short"); return false; }
+    const uint8_t *d = resp + sof + 6;
+    running = (d[0] == PENTAIR_RUN);
+    rpm = ((uint16_t)d[5] << 8) | d[6];
+    DBG_PRINTF("[Pentair] pump %u status: %s @ %u rpm\n", pumpId, running ? "RUNNING" : "stopped", rpm);
+    return true;
+}
+
 // ============================================================
 //  Emaux (9600, Modbus FC06, confirmed)
 // ============================================================
@@ -399,6 +453,42 @@ inline bool emauxRun(uint8_t pumpId, bool run) {
     return emauxWriteRegister(pumpId, EMAUX_REG_RUN, run ? EMAUX_RUN_CMD : EMAUX_STOP_CMD);
 }
 
+// Read one input register (FC04) — the pump's own report of what it is
+// actually doing. Returns the value, or -1 on any error.
+inline int32_t emauxReadInputRegister(uint8_t pumpAddr, uint16_t reg) {
+    rs485UseBaud(RS485_BAUD);
+    uint8_t frame[8] = {
+        pumpAddr, EMAUX_FC_READ_INPUT,
+        (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF),
+        0x00, 0x01
+    };
+    uint16_t crc = crc16Modbus(frame, 6);
+    frame[6] = crc & 0xFF;
+    frame[7] = (crc >> 8) & 0xFF;
+
+    rs485Send(frame, 8);
+
+    // Expected: addr fc byteCount val_hi val_lo crc_lo crc_hi = 7 bytes
+    // (16-byte headroom for glitch bytes, same as the write path).
+    uint8_t resp[16];
+    uint8_t rlen = rs485Receive(resp, sizeof(resp), RESPONSE_TIMEOUT_MS);
+    if (rlen < 7) {
+        DBG_PRINTF("[Emaux] read reg 0x%04X FAILED: short response (%u bytes)\n", reg, rlen);
+        return -1;
+    }
+    uint16_t rReceived = (uint16_t)resp[6] << 8 | resp[5];
+    if (rReceived != crc16Modbus(resp, 5)) {
+        DBG_PRINTF("[Emaux] read reg 0x%04X FAILED: CRC mismatch\n", reg);
+        return -1;
+    }
+    if (resp[0] != pumpAddr || resp[1] != EMAUX_FC_READ_INPUT) {
+        DBG_PRINTF("[Emaux] read reg 0x%04X FAILED: unexpected reply (addr=0x%02X fc=0x%02X)%s\n",
+                   reg, resp[0], resp[1], (resp[1] & 0x80) ? " -- Modbus exception" : "");
+        return -1;
+    }
+    return (int32_t)(((uint16_t)resp[3] << 8) | resp[4]);
+}
+
 // ============================================================
 //  Black & Decker (38400, Modbus FC06, FIRE-AND-FORGET)
 // ============================================================
@@ -432,8 +522,9 @@ inline void bdSendSpeed(uint8_t pumpId, uint16_t rpm) {
 // ============================================================
 //  Dispatcher — called every tick from relay_timer_latest.ino with each
 //  pump's desired state. Sends only when the desired state differs from
-//  the last applied one. Pentair/Emaux mark applied on the pump's
-//  acknowledgment (retrying silently otherwise); Black & Decker marks
+//  the last applied one. Pentair/Emaux run a closed loop: command
+//  (echo-confirmed) -> status readback until the pump itself reports
+//  the commanded state, re-sending on mismatch. Black & Decker marks
 //  applied the moment the frame is sent.
 // ============================================================
 inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, uint16_t speed) {
@@ -488,52 +579,151 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
         return;
     }
 
-    // ---- Pentair / Emaux: confirmed, silent retries ----------------
+    // ---- Pentair / Emaux: closed loop ------------------------------
+    // Phase 1 (send): speed then start (stop alone for OFF), each write
+    // confirmed by its echo. Phase 2 (verify): poll the pump's own
+    // status; only a readback matching the target flips the state flag.
+    // A mismatch after VERIFY_RESEND_MS re-enters phase 1.
+    PumpVerify &ver = pumpVerify[idx];
+    if (desiredChanged) {
+        ver.awaiting = false;
+        ver.everSent = false;
+        ver.pollLogged = false;
+        ver.resendLogged = false;
+    }
+
+    // The target the readback must show — the same clamping the setters apply.
+    uint16_t target = speed;
+    if (run) {
+        uint16_t lo = (pumpType == PUMP_PENTAIR) ? PENTAIR_RPM_MIN : EMAUX_RPM_MIN;
+        uint16_t hi = (pumpType == PUMP_PENTAIR) ? PENTAIR_RPM_MAX : EMAUX_RPM_MAX;
+        if (target < lo) target = lo;
+        if (target > hi) target = hi;
+    }
+
+    uint32_t nowMs = millis();
+
+    if (!ver.awaiting) {
+        // ---- Phase 1: send, confirmed by echo ----------------------
+        bool verboseSend = verboseAttempt && !ver.everSent;
+#if RS485_DEBUG
+        bool dbgSave = rs485DebugEnabled;
+        if (!verboseSend) rs485DebugEnabled = false;
+#endif
+        bool ok = true;
+        if (pumpType == PUMP_PENTAIR) {
+            if (!pentairEnsureControl(pumpId)) {
+#if RS485_DEBUG
+                rs485DebugEnabled = dbgSave;
+#endif
+                if (!memo.failLogged) {
+                    memo.failLogged = true;
+                    DBG_PRINTF("[Dispatcher] pump %u: Pentair control handshake pending — retrying silently\n", pumpId);
+                }
+                return;
+            }
+            if (run) {
+                ok = pentairSetSpeed(pumpId, speed) && ok;
+                ok = pentairRun(pumpId, true) && ok;
+            } else {
+                ok = pentairRun(pumpId, false) && ok;
+            }
+        } else { // PUMP_EMAUX
+            if (run) {
+                ok = emauxSetSpeed(pumpId, speed) && ok;
+                ok = emauxRun(pumpId, true) && ok;
+            } else {
+                ok = emauxRun(pumpId, false) && ok;
+            }
+        }
+#if RS485_DEBUG
+        rs485DebugEnabled = dbgSave;
+#endif
+        if (ok) {
+            ver.awaiting = true;
+            ver.everSent = true;
+            ver.lastSendMs = nowMs;
+            ver.lastPollMs = nowMs; // first status poll one interval from now
+            memo.failLogged = false;
+            if (verboseSend)
+                DBG_PRINTF("[Dispatcher] pump %u: command echoed OK — verifying by status readback\n", pumpId);
+        } else if (!memo.failLogged) {
+            memo.failLogged = true;
+            DBG_PRINTF("[Dispatcher] pump %u: command FAILED — retrying silently until it confirms or the request changes\n",
+                       pumpId);
+        }
+        return;
+    }
+
+    // ---- Phase 2: verify against the pump's own report -------------
+    if (nowMs - ver.lastPollMs < VERIFY_POLL_MS) return;
+    ver.lastPollMs = nowMs;
+    bool verbosePoll = !ver.pollLogged;
 #if RS485_DEBUG
     bool dbgSave = rs485DebugEnabled;
-    if (!verboseAttempt) rs485DebugEnabled = false;
+    if (!verbosePoll) rs485DebugEnabled = false;
 #endif
-    bool ok = true;
+    bool gotReport = false;
+    bool match = false;
+    uint16_t reported = 0;
     if (pumpType == PUMP_PENTAIR) {
-        if (!pentairEnsureControl(pumpId)) {
-#if RS485_DEBUG
-            rs485DebugEnabled = dbgSave;
-#endif
-            if (!memo.failLogged) {
-                memo.failLogged = true;
-                DBG_PRINTF("[Dispatcher] pump %u: Pentair control handshake pending — retrying silently\n", pumpId);
+        bool pRunning; uint16_t pRpm;
+        if (pentairReadStatus(pumpId, pRunning, pRpm)) {
+            gotReport = true;
+            reported = pRpm;
+            if (run) {
+                int32_t diff = (int32_t)pRpm - (int32_t)target;
+                if (diff < 0) diff = -diff;
+                match = pRunning && diff <= VERIFY_RPM_TOL;
+            } else {
+                match = !pRunning;
             }
-            return;
-        }
-        if (run) {
-            ok = pentairSetSpeed(pumpId, speed) && ok;
-            ok = pentairRun(pumpId, true) && ok;
-        } else {
-            ok = pentairRun(pumpId, false) && ok;
         }
     } else { // PUMP_EMAUX
         if (run) {
-            ok = emauxSetSpeed(pumpId, speed) && ok;
-            ok = emauxRun(pumpId, true) && ok;
+            int32_t cur = emauxReadInputRegister(pumpId, EMAUX_REG_CUR_SPEED);
+            if (cur >= 0) {
+                gotReport = true;
+                reported = (uint16_t)cur;
+                int32_t diff = cur - (int32_t)target;
+                if (diff < 0) diff = -diff;
+                match = diff <= VERIFY_RPM_TOL;
+            }
         } else {
-            ok = emauxRun(pumpId, false) && ok;
+            int32_t st = emauxReadInputRegister(pumpId, EMAUX_REG_RUN_STATUS);
+            if (st >= 0) {
+                gotReport = true;
+                reported = (uint16_t)st;
+                match = (st == 0);
+            }
         }
     }
 #if RS485_DEBUG
     rs485DebugEnabled = dbgSave;
 #endif
+    ver.pollLogged = true;
 
-    if (ok) {
+    if (match) {
         currentPumpStates[idx].active = run;
-        currentPumpStates[idx].speed = run ? speed : 0;
+        currentPumpStates[idx].speed = run ? target : 0;
         if (run) currentPumpStates[idx].type = pumpType;
+        ver.awaiting = false;
         memo.failLogged = false;
-        DBG_PRINTF("[Dispatcher] pump %u: state CONFIRMED applied (active=%d speed=%u)\n",
-                   pumpId, currentPumpStates[idx].active, currentPumpStates[idx].speed);
-    } else if (!memo.failLogged) {
-        memo.failLogged = true;
-        DBG_PRINTF("[Dispatcher] pump %u: command FAILED — retrying silently until it confirms or the request changes\n",
-                   pumpId);
+        DBG_PRINTF("[Dispatcher] pump %u: status VERIFIED (%s, readback=%u) — state applied\n",
+                   pumpId, run ? "running" : "stopped", reported);
+        return;
+    }
+
+    if (nowMs - ver.lastSendMs >= VERIFY_RESEND_MS) {
+        if (!ver.resendLogged) {
+            ver.resendLogged = true;
+            if (gotReport)
+                DBG_PRINTF("[Dispatcher] pump %u: readback %u doesn't match target — re-sending (silent retries)\n",
+                           pumpId, reported);
+            else
+                DBG_PRINTF("[Dispatcher] pump %u: no status reply — re-sending (silent retries)\n", pumpId);
+        }
+        ver.awaiting = false; // back to phase 1 next tick (silent)
     }
 }
 

@@ -2136,25 +2136,35 @@ function HomeScreen() {
   // Cleared when the device confirms (active flips true) or after 20s.
   const [pumpPending, setPumpPending] = useState<Record<number, number>>({});
   useEffect(() => {
-    setPumpPending((prev) => {
-      const ids = Object.keys(prev);
-      if (ids.length === 0) return prev;
-      const next: Record<number, number> = { ...prev };
-      let changed = false;
-      for (const idStr of ids) {
-        const id = Number(idStr);
-        const pump = pumps.find((pp) => pp.id === id);
-        // Black & Decker pending is cleared by its own fixed 500ms timer
-        // (set in turnOn), not by confirmation — its pill flips
-        // optimistically, which would otherwise cancel the flash early.
-        if (pump?.pumpType === 'Black & Decker') continue;
-        if (pump?.active || Date.now() - prev[id] > 20000) {
-          delete next[id];
-          changed = true;
+    const check = () => {
+      setPumpPending((prev) => {
+        const ids = Object.keys(prev);
+        if (ids.length === 0) return prev;
+        const next: Record<number, number> = { ...prev };
+        let changed = false;
+        for (const idStr of ids) {
+          const id = Number(idStr);
+          const pump = pumps.find((pp) => pp.id === id);
+          // Black & Decker pending is cleared by its own fixed 1s timer
+          // (set in turnOn), not by confirmation — its pill flips
+          // optimistically, which would otherwise cancel the flash early.
+          if (pump?.pumpType === 'Black & Decker') continue;
+          const elapsed = Date.now() - prev[id];
+          // Clear on confirmation, but never before 1s so the
+          // "Turning on…" flash stays visible; give up after 20s.
+          if ((pump?.active && elapsed >= 1000) || elapsed > 20000) {
+            delete next[id];
+            changed = true;
+          }
         }
-      }
-      return changed ? next : prev;
-    });
+        return changed ? next : prev;
+      });
+    };
+    check();
+    // A confirmation landing inside the first second is skipped by the
+    // check above — re-check shortly after so it still clears at ~1s.
+    const t = setTimeout(check, 1100);
+    return () => clearTimeout(t);
     // Runs on every state push (2-5s cadence), which is also often enough
     // to enforce the 20s give-up without a dedicated timer.
   }, [pumps]);
@@ -2298,7 +2308,7 @@ function HomeScreen() {
             setPumpPending((prev) => ({ ...prev, [p.id]: Date.now() }));
             if (shownType === 'Black & Decker') {
               // Fire-and-forget: no acknowledgment will ever come. Show
-              // "Turning on…" for a fixed 500ms as tap feedback, then the
+              // "Turning on…" for a fixed 1s as tap feedback, then the
               // button returns to normal; the pill has already flipped ON
               // optimistically via setPumpMode ("sent" semantics).
               setTimeout(() => {
@@ -2308,7 +2318,7 @@ function HomeScreen() {
                   delete next[p.id];
                   return next;
                 });
-              }, 500);
+              }, 1000);
             }
             // Other families: the amber state holds until the pump
             // acknowledges (cleared by the effect above), or 20s.
