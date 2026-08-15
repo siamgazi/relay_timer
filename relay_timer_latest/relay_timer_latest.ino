@@ -211,6 +211,8 @@ void loop() {
 
   processPendingSaves();
 
+  if (Serial.available()) handleSerialCommand();
+
   Btn b = getButton();
   if (b != BTN_NONE) {
     lastInteractionMs = millis();
@@ -236,6 +238,136 @@ void loop() {
     lastDrawMs = millis();
     needRedraw = false;
   }
+}
+
+// ============================================================
+//  SERIAL COMMANDS — mirror of the app's pump controls
+// ============================================================
+// Every command routes through the SAME shared-state mutators the app's
+// BLE/HTTP handler uses (pumpManualParamsSet / pumpModeSet) and the same
+// validation helpers (appSpeedValidFor, the B&D pump-1 rule) — so the
+// dispatcher, confirmation rules, and fire-and-forget semantics behave
+// identically no matter which side issued the command. Because
+// pumpModeSet bumps the state version, a serial change also pushes to
+// any connected phone, and an app change is visible here via `status`.
+//
+//   pump <1-4> on <rpm> [pentair|emaux|bd]   like the app's Turn on
+//   pump <1-4> off                            like the app's Off
+//   pump <1-4> auto                           schedule control
+//   pump <1-4> type <pentair|emaux|bd>        like the type dropdown
+//   pump <1-4> speed <rpm>                    like the speed field
+//   status                                    all pumps, set + actual
+//   debug on|off                              RS485 wire trace
+//   help
+int serialParsePumpType(const String &t) {
+  if (t == "pentair") return PUMP_PENTAIR;
+  if (t == "emaux") return PUMP_EMAUX;
+  if (t == "bd" || t == "blackdecker" || t == "b&d") return PUMP_BLACKDECKER;
+  return -1;
+}
+
+void serialPrintPumpStatus() {
+  for (int n = 1; n <= MAX_PUMPS; n++) {
+    uint16_t setSpd; uint8_t t;
+    pumpManualParamsGet(n, setSpd, t);
+    bool act; uint16_t actSpd;
+    pumpActualStateGet(n, act, actSpd);
+    Serial.printf("Pump %d: mode=%-4s type=%-8s set=%u rpm | actual: ",
+                  n, modeStr(pumpModeGet(n)), pumpTypeName(t), setSpd);
+    if (act) Serial.printf("ON @ %u rpm\n", actSpd);
+    else Serial.println("OFF");
+  }
+}
+
+void handleSerialCommand() {
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+  line.toLowerCase();
+
+  // Tokenize (max 5 tokens: pump <n> <verb> <arg> <arg>)
+  String tok[5];
+  int nTok = 0;
+  int start = 0;
+  while (nTok < 5 && start < (int)line.length()) {
+    int sp = line.indexOf(' ', start);
+    if (sp < 0) sp = line.length();
+    if (sp > start) tok[nTok++] = line.substring(start, sp);
+    start = sp + 1;
+  }
+
+  if (tok[0] == "help") {
+    Serial.println("Commands: pump <1-4> on <rpm> [pentair|emaux|bd] | pump <1-4> off | pump <1-4> auto");
+    Serial.println("          pump <1-4> type <pentair|emaux|bd> | pump <1-4> speed <rpm> | status | debug on/off");
+    return;
+  }
+  if (tok[0] == "status") { serialPrintPumpStatus(); return; }
+  if (tok[0] == "debug" && nTok >= 2) { rs485SetDebug(tok[1] == "on"); return; }
+
+  if (tok[0] != "pump" || nTok < 3) {
+    Serial.println("Unknown command — type 'help'.");
+    return;
+  }
+  int n = tok[1].toInt();
+  if (n < 1 || n > MAX_PUMPS) {
+    Serial.printf("pump must be 1-%d\n", MAX_PUMPS);
+    return;
+  }
+
+  uint16_t curSpeed; uint8_t curType;
+  pumpManualParamsGet(n, curSpeed, curType);
+
+  if (tok[2] == "on") {
+    if (nTok < 4) { Serial.println("Usage: pump <n> on <rpm> [pentair|emaux|bd]"); return; }
+    int rpm = tok[3].toInt();
+    uint8_t type = curType;
+    if (nTok >= 5) {
+      int t = serialParsePumpType(tok[4]);
+      if (t < 0) { Serial.println("type must be pentair, emaux or bd"); return; }
+      type = (uint8_t)t;
+    }
+    // Same rules the app's setPumpConfig enforces:
+    if (type == PUMP_BLACKDECKER && n != 1) {
+      Serial.println("Black & Decker is only supported on Pump 1");
+      return;
+    }
+    if (!appSpeedValidFor(type, rpm)) {
+      Serial.println(appSpeedRangeMsg(type));
+      return;
+    }
+    // Exactly the app's Turn on: params first, then the mode flip that
+    // makes the dispatcher drive the pump.
+    pumpManualParamsSet(n, (uint16_t)rpm, type);
+    pumpModeSet(n, MODE_ON);
+    Serial.printf("OK: pump %d ON at %d rpm (%s)%s\n", n, rpm, pumpTypeName(type),
+                  type == PUMP_BLACKDECKER ? " — fire-and-forget" : " — waiting for pump ack");
+    return;
+  }
+  if (tok[2] == "off")  { pumpModeSet(n, MODE_OFF);  Serial.printf("OK: pump %d OFF\n", n);  return; }
+  if (tok[2] == "auto") { pumpModeSet(n, MODE_AUTO); Serial.printf("OK: pump %d AUTO\n", n); return; }
+
+  if (tok[2] == "type" && nTok >= 4) {
+    int t = serialParsePumpType(tok[3]);
+    if (t < 0) { Serial.println("type must be pentair, emaux or bd"); return; }
+    if (t == PUMP_BLACKDECKER && n != 1) {
+      Serial.println("Black & Decker is only supported on Pump 1");
+      return;
+    }
+    pumpManualParamsSet(n, curSpeed, (uint8_t)t);
+    markDirty();
+    Serial.printf("OK: pump %d type = %s\n", n, pumpTypeName((uint8_t)t));
+    return;
+  }
+  if (tok[2] == "speed" && nTok >= 4) {
+    int rpm = tok[3].toInt();
+    if (!appSpeedValidFor(curType, rpm)) { Serial.println(appSpeedRangeMsg(curType)); return; }
+    pumpManualParamsSet(n, (uint16_t)rpm, curType);
+    markDirty();
+    Serial.printf("OK: pump %d speed = %d rpm (takes effect on next ON)\n", n, rpm);
+    return;
+  }
+
+  Serial.println("Unknown command — type 'help'.");
 }
 
 // ============================================================

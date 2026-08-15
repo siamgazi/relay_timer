@@ -1,6 +1,27 @@
 #pragma once
 #include <Arduino.h>
 
+// ============================================================
+//  RS485 PUMP DRIVERS — Pentair / Emaux / Black & Decker
+// ============================================================
+// One bus, two speeds, three protocols:
+//
+//   Pentair  (slot addr 0x60+n) — proprietary framing, 9600 baud.
+//             CONFIRMED: every command waits for a checksum-valid reply,
+//             and needs a one-time "take control" handshake first.
+//   Emaux    (slot addr = slot) — Modbus RTU FC06, 9600 baud.
+//             CONFIRMED: the write echo is required before the state
+//             flag flips.
+//   B&D      (fixed addr 1, pump slot 1 ONLY) — Modbus RTU FC06, 38400.
+//             FIRE-AND-FORGET by design: one setpoint write (speed to
+//             run, 0 to stop), NO reply is awaited and RX is never
+//             listened to for this pump. "ON" therefore means "command
+//             was sent", not "pump acknowledged".
+//
+// Workflow (per bring-up spec): select the family's baud rate first —
+// if that changes the UART, wait 500ms — then send. Same-family
+// commands in a row pay no settle delay.
+
 // ---- Debug logging -----------------------------------------
 // RS485_DEBUG: compile-time master switch. Set to 0 to strip all debug
 // code out of the build entirely (smallest/fastest production build).
@@ -9,11 +30,10 @@
 #endif
 
 #if RS485_DEBUG
-  // Runtime on/off switch. Debug code is compiled in either way (as long
-  // as RS485_DEBUG above is 1), but output only prints while this is
-  // true -- flip it live via rs485SetDebug(), e.g. from a serial command
-  // or a web UI toggle, without reflashing.
-  bool rs485DebugEnabled = false;
+  // Runtime switch; output only prints while true. Defaulted ON for
+  // bring-up — the log follows a print-on-change discipline, so a
+  // healthy system is quiet. Set false once the pumps are proven.
+  bool rs485DebugEnabled = true;
 
   inline void rs485SetDebug(bool on) {
       rs485DebugEnabled = on;
@@ -25,16 +45,12 @@
   #define DBG_PRINTLN(...)  do { if (rs485DebugEnabled) Serial.println(__VA_ARGS__); } while (0)
   #define DBG_PRINTF(...)   do { if (rs485DebugEnabled) Serial.printf(__VA_ARGS__); } while (0)
 #else
-  // Compiled out entirely -- rs485SetDebug() still exists as a no-op so
-  // callers don't need to #ifdef around it.
   inline void rs485SetDebug(bool on) { (void)on; }
-
   #define DBG_PRINT(...)
   #define DBG_PRINTLN(...)
   #define DBG_PRINTF(...)
 #endif
 
-// Prints a byte buffer as space-separated hex, e.g. "02 06 00 08 00 01 4C 3B"
 inline void dbgHexDump(const uint8_t *buf, uint8_t len) {
 #if RS485_DEBUG
     if (!rs485DebugEnabled) return;
@@ -47,34 +63,31 @@ inline void dbgHexDump(const uint8_t *buf, uint8_t len) {
 #endif
 }
 
-#define RS485_SERIAL Serial2
-#define DE_RE_PIN 4
-#define RS485_BAUD 9600
+// ---- Bus / pins --------------------------------------------
+#define RS485_SERIAL   Serial2
+#define DE_RE_PIN      4
+#define RS485_RX_GPIO  18
+#define RS485_TX_GPIO  17
+#define RS485_BAUD     9600UL   // home baud: Pentair + Emaux
 
-#define RESPONSE_TIMEOUT_MS   500   // max wait for first reply byte
-#define INTERCHAR_TIMEOUT_MS  15    // max gap between reply bytes
-// One byte on the wire takes 10 bit-times; wait that long after flush()
-// so the UART shift register finishes the stop bit before we pull DE/RE
-// low again, or the last byte gets clipped on the bus. Computed from the
-// CURRENT baud, because the bus now runs at two speeds: 9600 for
-// Pentair/Emaux, 38400 for Black & Decker (see rs485UseBaud below).
-uint32_t rs485CurrentBaud = RS485_BAUD;
-#define BYTE_TIME_US  (10UL * 1000000UL / rs485CurrentBaud + 300UL)
+#define RESPONSE_TIMEOUT_MS   500  // Emaux: max wait for first reply byte
+#define PENTAIR_TIMEOUT_MS    1000 // Pentair replies can be slower (proven value)
+#define INTERCHAR_TIMEOUT_MS  15   // max gap between reply bytes
+#define RS485_BAUD_SETTLE_MS  500  // spec: settle after every baud change
 
-// ---- Pentair IntelliFlo VS/VF (proprietary RS485, NOT Modbus) ----
-#define PENTAIR_CTRL_ADDR     0x10   // us, acting as the automation controller
-#define PENTAIR_BASE_ADDR     0x60   // Pentair pumps live at 0x60-0x6F on the bus
-                                      // (dip-switch address), NOT raw pump slot 1-4
+// ---- Pentair IntelliFlo VS/VF (proprietary RS485) ----------
+#define PENTAIR_CTRL_ADDR     0x10  // us, the automation controller
+#define PENTAIR_BASE_ADDR     0x60  // slot 1 = 0x60, slot 2 = 0x61, ...
 #define PENTAIR_CMD_SPEED     0x01
-#define PENTAIR_CMD_CONTROL   0x04   // must be sent once before the pump accepts remote commands
+#define PENTAIR_CMD_CONTROL   0x04  // one-time "take control" handshake
 #define PENTAIR_CMD_RUN       0x06
 #define PENTAIR_RUN           0x0A
 #define PENTAIR_STOP          0x04
 #define PENTAIR_RPM_MIN       450
 #define PENTAIR_RPM_MAX       3450
-#define PENTAIR_CONTROL_RETRY_MS 3000 // don't hammer the bus retrying "take control"
+#define PENTAIR_CONTROL_RETRY_MS 3000
 
-// ---- Emaux pump (Modbus RTU, function 0x06 write-single-register) ----
+// ---- Emaux (Modbus RTU FC06) -------------------------------
 #define EMAUX_FC_WRITE     0x06
 #define EMAUX_REG_RUN      0x0008
 #define EMAUX_REG_SPEED    0x0009
@@ -83,137 +96,170 @@ uint32_t rs485CurrentBaud = RS485_BAUD;
 #define EMAUX_RPM_MIN      800
 #define EMAUX_RPM_MAX      3400
 
-// ---- Black & Decker pump (Modbus RTU, function 0x06, 38400 baud) ----
-// Same frame shape and CRC as the Emaux, but different registers, a
-// scaled speed value, and — crucially — a different bus speed: this pump
-// listens at 38400 while Pentair/Emaux run at 9600. The driver switches
-// the UART baud per transaction (rs485UseBaud). Only ONE Black & Decker
-// pump is supported, and it must be pump slot 1: the pump is fixed at
-// Modbus address 1.
+// ---- Black & Decker (Modbus RTU FC06, 38400, addr 1 only) --
 #define BD_BAUD         38400UL
 #define BD_FC_WRITE     0x06
 #define BD_REG_SPEED    0x0007
-#define BD_REG_RUN      0x1000
-#define BD_RUN_CMD      1
-#define BD_STOP_CMD     0
 #define BD_RPM_SCALE    5      // register value = rpm * 5
 #define BD_RPM_MIN      600    // adjust to your pump's real envelope
 #define BD_RPM_MAX      3450
+// Fire-and-forget reliability: with no acknowledgment ever read, the
+// same frame is fired several times so a single lost/garbled frame
+// can't mean a missed command. Writes are idempotent (same register,
+// same value), so repeats are harmless. 3 shots with 150ms gaps span
+// ~330ms — inside the app's 500ms "Turning on…" feedback window.
+#define BD_SEND_REPEATS   3
+#define BD_REPEAT_GAP_MS  150
 
+// ---- Shared state ------------------------------------------
 struct PumpState {
     bool active = false;
     uint16_t speed = 0;
-    uint8_t  type = PUMP_PENTAIR; // protocol this pump was last actually driven with
+    uint8_t  type = PUMP_PENTAIR; // protocol this pump was last driven with
 };
 PumpState currentPumpStates[MAX_PUMPS];
 
-// Pentair requires a one-time "take remote control" handshake per pump
-// address before it will accept speed/run commands. Tracked per pump so
-// pump 1..4 (RS485 addresses 1..4) are each handshaken independently.
+// Pentair needs its handshake once per pump before accepting commands.
 bool pentairControlTaken[MAX_PUMPS] = {false, false, false, false};
 unsigned long pentairControlLastTry[MAX_PUMPS] = {0, 0, 0, 0};
 
+// Per-pump memo of the last situation the serial log REPORTED — the log
+// only speaks when something changes: a new desired state, the first
+// failure of it, or the eventual confirmation. Retries stay silent.
+struct PumpLogMemo {
+    bool     haveDesired = false;
+    bool     run = false;
+    uint16_t speed = 0;
+    uint8_t  type = 0;
+    bool     failLogged = false;
+};
+PumpLogMemo pumpLogMemo[MAX_PUMPS];
+
+// ---- Bus lifecycle -----------------------------------------
+uint32_t rs485CurrentBaud = RS485_BAUD;
+
 inline void rs485Begin() {
+    RS485_SERIAL.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_GPIO, RS485_TX_GPIO);
+    RS485_SERIAL.setRxBufferSize(1024);
     pinMode(DE_RE_PIN, OUTPUT);
     digitalWrite(DE_RE_PIN, LOW);
-    RS485_SERIAL.begin(RS485_BAUD, SERIAL_8N1, 18, 17); // RX=18, TX=17
-    DBG_PRINTF("[RS485] begin: baud=%lu RX=18 TX=17 DE/RE=%d\n", (unsigned long)RS485_BAUD, DE_RE_PIN);
+    rs485CurrentBaud = RS485_BAUD;
+    DBG_PRINTF("[RS485] begin: baud=%lu RX=%d TX=%d DE/RE=%d\n",
+               (unsigned long)RS485_BAUD, RS485_RX_GPIO, RS485_TX_GPIO, DE_RE_PIN);
 }
 
-// ---------------- Shared low-level transceiver ----------------
+// Retunes the UART when the next transaction targets the other bus
+// speed, then settles for 500ms (spec). updateBaudRate only rewrites the
+// clock divisor — pin routing is never touched — and the actual rate is
+// logged with every TX, so a failed retune would be visible.
+inline void rs485UseBaud(uint32_t baud) {
+    if (rs485CurrentBaud == baud) return;
+    RS485_SERIAL.flush();
+    RS485_SERIAL.updateBaudRate(baud);
+    rs485CurrentBaud = baud;
+    DBG_PRINTF("[RS485] baud switched to %lu (readback %lu), settling %dms\n",
+               (unsigned long)baud, (unsigned long)RS485_SERIAL.baudRate(),
+               RS485_BAUD_SETTLE_MS);
+    delay(RS485_BAUD_SETTLE_MS);
+}
+
+// ---- Low-level transceiver ---------------------------------
 inline void rs485FlushRx() {
     while (RS485_SERIAL.available()) RS485_SERIAL.read();
 }
 
-// Retunes the UART when the next transaction targets a pump family on the
-// other bus speed. Each protocol driver calls this at the top of its
-// send, so mixed Pentair/Emaux (9600) and Black & Decker (38400) traffic
-// interleaves safely on the same wire.
-inline void rs485UseBaud(uint32_t baud) {
-    if (rs485CurrentBaud == baud) return;
-    RS485_SERIAL.flush();               // never re-tune under an in-flight TX
-    RS485_SERIAL.updateBaudRate(baud);
-    rs485CurrentBaud = baud;
-    DBG_PRINTF("[RS485] baud switched to %lu\n", (unsigned long)baud);
-}
+// Wire time of one byte at the current baud, plus margin — waited after
+// flush() so the last stop bit clears the bus before DE drops (the
+// proven timing from the standalone Pentair/Emaux sketches).
+#define RS485_BYTE_TIME_US (10UL * 1000000UL / rs485CurrentBaud + 300UL)
 
-// Minimum quiet time to leave the bus before starting a new transaction.
-// Applied at the START of the next send (not after this one's receive
-// window) so it never eats into a fast slave's response window.
 #define RS485_INTERFRAME_DELAY_MS 10
 
 inline void rs485Send(const uint8_t *frame, uint8_t len) {
     delay(RS485_INTERFRAME_DELAY_MS); // let the bus settle before we grab it
-    rs485FlushRx();
+    rs485FlushRx();                   // stale bytes must not pollute the reply
     DBG_PRINT("[RS485] TX (");
     DBG_PRINT(len);
-    DBG_PRINT(" bytes): ");
+    DBG_PRINT(" bytes @ ");
+    DBG_PRINT(RS485_SERIAL.baudRate());
+    DBG_PRINT(" baud): ");
     dbgHexDump(frame, len);
 
     digitalWrite(DE_RE_PIN, HIGH);
     delayMicroseconds(100);
     RS485_SERIAL.write(frame, len);
     RS485_SERIAL.flush();
-    delayMicroseconds(BYTE_TIME_US); // let the last stop bit clear the wire
+    delayMicroseconds(RS485_BYTE_TIME_US);
     digitalWrite(DE_RE_PIN, LOW);
-
-    // FIX: transceiver echo / transition noise settles within microseconds
-    // of DE/RE dropping, NOT milliseconds. The previous version waited
-    // 20ms and *then* flushed -- plenty of time for a fast-responding
-    // pump's real reply to already be sitting in the buffer, so that
-    // flush was silently eating the start of legitimate responses
-    // (confirmed by debug output: 9 bytes discarded for an 8-byte TX,
-    // immediately followed by an RX timeout). Flush right away instead,
-    // with only a brief settle time for the transceiver itself.
-    delayMicroseconds(200);
-#if RS485_DEBUG
-    uint8_t echoCount = 0;
-    while (RS485_SERIAL.available()) { RS485_SERIAL.read(); echoCount++; }
-    if (echoCount > 0) {
-        DBG_PRINT("[RS485] discarded ");
-        DBG_PRINT(echoCount);
-        DBG_PRINTLN(" echo byte(s) after TX");
-    }
-#else
-    rs485FlushRx();
-#endif
+    // No post-TX RX discard: an eager cleanup here once ate the front of
+    // fast replies. Anything arriving after TX belongs to the receiver.
 }
 
-// Two-stage receive: wait up to RESPONSE_TIMEOUT_MS for the first byte,
-// then keep collecting until a short inter-character gap.
-inline uint8_t rs485Receive(uint8_t *buf, uint8_t maxLen) {
-    unsigned long start = millis();
-    while (!RS485_SERIAL.available()) {
-        if (millis() - start > RESPONSE_TIMEOUT_MS) {
-            DBG_PRINTLN("[RS485] RX timeout: no bytes received");
-            return 0;
+// Two-stage receive with glitch tolerance: leading 0x00 bytes are the
+// DE-release artifact (no legitimate reply starts with 0x00 — Modbus
+// addresses are 1+, Pentair frames start 0xFF), so they're stripped and
+// listening continues until the deadline instead of letting noise
+// anchor-and-close the window. Used by Pentair and Emaux only — the
+// Black & Decker path never reads RX at all.
+inline uint8_t rs485Receive(uint8_t *buf, uint8_t maxLen, uint16_t timeoutMs) {
+    unsigned long deadline = millis() + timeoutMs;
+    while (true) {
+        while (!RS485_SERIAL.available()) {
+            if (millis() > deadline) {
+                DBG_PRINTLN("[RS485] RX timeout: no bytes received");
+                return 0;
+            }
+        }
+        unsigned long firstByteAt = millis();
+        uint8_t idx = 0;
+        unsigned long last = millis();
+        while (idx < maxLen) {
+            if (RS485_SERIAL.available()) {
+                buf[idx++] = RS485_SERIAL.read();
+                last = millis();
+            } else if (millis() - last > INTERCHAR_TIMEOUT_MS) {
+                break;
+            }
+        }
+
+        if (idx == maxLen) {
+            DBG_PRINTLN("[RS485] WARNING: RX buffer full — tail of the frame may be unread");
+        }
+
+        uint8_t skip = 0;
+        while (skip < idx && buf[skip] == 0x00) skip++;
+        if (skip > 0) {
+            DBG_PRINTF("[RS485] stripped %u leading glitch byte(s)\n", skip);
+            memmove(buf, buf + skip, idx - skip);
+            idx -= skip;
+        }
+        if (idx == 0) continue; // pure glitch — the real reply may still come
+
+        DBG_PRINT("[RS485] RX (");
+        DBG_PRINT(idx);
+        DBG_PRINT(" bytes, ");
+        DBG_PRINT(millis() - firstByteAt);
+        DBG_PRINT("ms after first byte): ");
+        dbgHexDump(buf, idx);
+        return idx;
+    }
+}
+
+// ---- Modbus CRC16 (shared by Emaux + B&D) ------------------
+inline uint16_t crc16Modbus(const uint8_t *buf, uint8_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
         }
     }
-    unsigned long firstByteAt = millis();
-    uint8_t idx = 0;
-    start = millis();
-    while (idx < maxLen) {
-        if (RS485_SERIAL.available()) {
-            buf[idx++] = RS485_SERIAL.read();
-            start = millis();
-        } else if (millis() - start > INTERCHAR_TIMEOUT_MS) {
-            break;
-        }
-    }
-    DBG_PRINT("[RS485] RX (");
-    DBG_PRINT(idx);
-    DBG_PRINT(" bytes, ");
-    DBG_PRINT(millis() - firstByteAt);
-    DBG_PRINT("ms after first byte): ");
-    dbgHexDump(buf, idx);
-    if (idx == maxLen) {
-        DBG_PRINTLN("[RS485] WARNING: RX buffer full — response may have been truncated, consider raising maxLen");
-    }
-    return idx;
+    return crc;
 }
 
 // ============================================================
-//  Pentair
+//  Pentair (9600, confirmed)
 // ============================================================
 inline uint16_t pentairChecksum(const uint8_t *buf, uint8_t len) {
     uint16_t sum = 0;
@@ -221,19 +267,18 @@ inline uint16_t pentairChecksum(const uint8_t *buf, uint8_t len) {
     return sum;
 }
 
-// dst = the target pump's RS485 address (its configured pump ID, 1-4).
 inline uint8_t pentairBuildPacket(uint8_t *buf, uint8_t dst, uint8_t cmd,
                                    const uint8_t *data, uint8_t dLen) {
-    buf[0] = 0xFF; buf[1] = 0x00; buf[2] = 0xFF;      // preamble
-    buf[3] = 0xA5;                                     // SOF / checksum start
-    buf[4] = 0x00;                                     // protocol version
+    buf[0] = 0xFF; buf[1] = 0x00; buf[2] = 0xFF;   // preamble
+    buf[3] = 0xA5;                                  // SOF / checksum start
+    buf[4] = 0x00;                                  // protocol version
     buf[5] = dst;
     buf[6] = PENTAIR_CTRL_ADDR;
     buf[7] = cmd;
     buf[8] = dLen;
     for (uint8_t i = 0; i < dLen; i++) buf[9 + i] = data[i];
-    uint16_t ck = pentairChecksum(buf + 3, 6 + dLen);  // covers A5..end of data
-    buf[9 + dLen]  = (uint8_t)(ck >> 8);                // high byte first
+    uint16_t ck = pentairChecksum(buf + 3, 6 + dLen);
+    buf[9 + dLen]  = (uint8_t)(ck >> 8);            // high byte first
     buf[10 + dLen] = (uint8_t)(ck & 0xFF);
     return 11 + dLen;
 }
@@ -243,81 +288,52 @@ inline bool pentairValidateResponse(const uint8_t *buf, uint8_t len) {
     for (uint8_t i = 0; i < len; i++) {
         if (buf[i] == 0xA5) { sof = i; break; }
     }
-    if (sof < 0) {
-        DBG_PRINTLN("[Pentair] validate FAILED: no 0xA5 start-of-frame found in response");
-        return false;
-    }
-    if ((uint8_t)(len - sof) < 8) {
-        DBG_PRINTLN("[Pentair] validate FAILED: response too short after SOF");
-        return false;
-    }
+    if (sof < 0) { DBG_PRINTLN("[Pentair] validate FAILED: no 0xA5 SOF"); return false; }
+    if ((uint8_t)(len - sof) < 8) { DBG_PRINTLN("[Pentair] validate FAILED: too short after SOF"); return false; }
     uint8_t dataLen = buf[sof + 5];
     if ((uint8_t)(len - sof) < (uint8_t)(8 + dataLen)) {
-        DBG_PRINT("[Pentair] validate FAILED: declared dataLen=");
-        DBG_PRINT(dataLen);
-        DBG_PRINTLN(" exceeds bytes actually received");
+        DBG_PRINTLN("[Pentair] validate FAILED: declared dataLen exceeds bytes received");
         return false;
     }
     uint16_t computed = pentairChecksum(buf + sof, 6 + dataLen);
     uint16_t received = ((uint16_t)buf[sof + 6 + dataLen] << 8) | buf[sof + 7 + dataLen];
     if (computed != received) {
-        DBG_PRINTF("[Pentair] validate FAILED: checksum mismatch (computed=0x%04X received=0x%04X)\n", computed, received);
+        DBG_PRINTF("[Pentair] validate FAILED: checksum (computed=0x%04X received=0x%04X)\n", computed, received);
         return false;
     }
-    DBG_PRINTLN("[Pentair] validate OK");
     return true;
 }
 
-// Converts our internal pump slot (1-4) into the pump's actual RS485 bus
-// address. Pentair pumps are addressed 0x60-0x6F (set via dip switches on
-// the pump board) - they do NOT use raw Modbus-style 1-4 addressing like
-// the Emaux pumps do. Slot 1 -> 0x60, slot 2 -> 0x61, etc. If your physical
-// pump's dip switches are set to a different address than this convention,
-// adjust the mapping here to match.
+// Slot (1-4) -> bus address 0x60-0x63 (dip-switch convention).
 inline uint8_t pentairBusAddress(uint8_t pumpId) {
     return PENTAIR_BASE_ADDR + (pumpId - 1);
 }
 
-// Sends one Pentair command to pumpId and waits for a checksum-valid reply.
 inline bool pentairSendCmd(uint8_t pumpId, uint8_t cmd, const uint8_t *data, uint8_t dLen) {
-    rs485UseBaud(RS485_BAUD); // Pentair talks at 9600
-    DBG_PRINTF("[Pentair] pumpId=%u addr=0x%02X cmd=0x%02X dLen=%u\n",
-               pumpId, pentairBusAddress(pumpId), cmd, dLen);
-    uint8_t frame[16];
+    rs485UseBaud(RS485_BAUD);
+    uint8_t frame[32];
     uint8_t flen = pentairBuildPacket(frame, pentairBusAddress(pumpId), cmd, data, dLen);
     rs485Send(frame, flen);
-    uint8_t resp[24];
-    uint8_t rlen = rs485Receive(resp, sizeof(resp));
-    if (rlen == 0) {
-        DBG_PRINTLN("[Pentair] sendCmd FAILED: no response");
-        return false;
-    }
-    bool ok = pentairValidateResponse(resp, rlen);
-    DBG_PRINTF("[Pentair] sendCmd result: %s\n", ok ? "OK" : "FAILED");
-    return ok;
+    uint8_t resp[40];
+    uint8_t rlen = rs485Receive(resp, sizeof(resp), PENTAIR_TIMEOUT_MS);
+    if (rlen == 0) return false;
+    return pentairValidateResponse(resp, rlen);
 }
 
-// Must succeed once per pump before any speed/run command will be
-// accepted. Retried on a timer (not every loop tick) so a pump that's
-// still booting doesn't get flooded with handshake attempts.
+// One-time handshake per pump, retried on a cooldown.
 inline bool pentairEnsureControl(uint8_t pumpId) {
     int idx = pumpId - 1;
     if (pentairControlTaken[idx]) return true;
     unsigned long now = millis();
-    if (now - pentairControlLastTry[idx] < PENTAIR_CONTROL_RETRY_MS && pentairControlLastTry[idx] != 0) {
-        DBG_PRINTF("[Pentair] pump %u control handshake on cooldown, %lums left\n",
-                   pumpId, PENTAIR_CONTROL_RETRY_MS - (now - pentairControlLastTry[idx]));
+    if (pentairControlLastTry[idx] != 0 && now - pentairControlLastTry[idx] < PENTAIR_CONTROL_RETRY_MS)
         return false;
-    }
     pentairControlLastTry[idx] = now;
-    DBG_PRINTF("[Pentair] pump %u attempting 'take control' handshake\n", pumpId);
     uint8_t data[] = {0xFF, 0xFF}; // "external controller present"
     if (pentairSendCmd(pumpId, PENTAIR_CMD_CONTROL, data, 2)) {
         pentairControlTaken[idx] = true;
-        DBG_PRINTF("[Pentair] pump %u control handshake SUCCEEDED\n", pumpId);
+        DBG_PRINTF("[Pentair] pump %u control handshake OK\n", pumpId);
         return true;
     }
-    DBG_PRINTF("[Pentair] pump %u control handshake FAILED, will retry in %lums\n", pumpId, PENTAIR_CONTROL_RETRY_MS);
     return false;
 }
 
@@ -334,54 +350,39 @@ inline bool pentairRun(uint8_t pumpId, bool run) {
 }
 
 // ============================================================
-//  Emaux (Modbus RTU write-single-register, FC 0x06)
+//  Emaux (9600, Modbus FC06, confirmed)
 // ============================================================
-inline uint16_t emauxCrc(const uint8_t *buf, uint8_t len) {
-    uint16_t crc = 0xFFFF;
-    for (uint8_t i = 0; i < len; i++) {
-        crc ^= buf[i];
-        for (uint8_t b = 0; b < 8; b++) {
-            if (crc & 1) crc = (crc >> 1) ^ 0xA001;
-            else crc >>= 1;
-        }
-    }
-    return crc;
-}
-
-// pumpAddr = the target pump's configured Modbus slave address (1-4).
 inline bool emauxWriteRegister(uint8_t pumpAddr, uint16_t reg, uint16_t val) {
-    rs485UseBaud(RS485_BAUD); // Emaux talks at 9600
+    rs485UseBaud(RS485_BAUD);
     DBG_PRINTF("[Emaux] pumpAddr=%u reg=0x%04X val=%u\n", pumpAddr, reg, val);
     uint8_t frame[8] = {
         pumpAddr, EMAUX_FC_WRITE,
         (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF),
         (uint8_t)(val >> 8), (uint8_t)(val & 0xFF)
     };
-    uint16_t crc = emauxCrc(frame, 6);
+    uint16_t crc = crc16Modbus(frame, 6);
     frame[6] = crc & 0xFF;
     frame[7] = (crc >> 8) & 0xFF;
 
     rs485Send(frame, 8);
 
-    uint8_t resp[8];
-    uint8_t rlen = rs485Receive(resp, sizeof(resp));
+    // 16-byte headroom: a glitch byte in an exactly-sized buffer once
+    // displaced the echo's final CRC byte and failed every confirm.
+    uint8_t resp[16];
+    uint8_t rlen = rs485Receive(resp, sizeof(resp), RESPONSE_TIMEOUT_MS);
     if (rlen < 8) {
-        DBG_PRINTF("[Emaux] writeRegister FAILED: short response (%u bytes, expected 8)\n", rlen);
+        DBG_PRINTF("[Emaux] writeRegister FAILED: short response (%u bytes)\n", rlen);
         return false;
     }
-
     uint16_t rReceived = (uint16_t)resp[7] << 8 | resp[6];
-    uint16_t rComputed = emauxCrc(resp, 6);
-    if (rReceived != rComputed) {
-        DBG_PRINTF("[Emaux] writeRegister FAILED: CRC mismatch (computed=0x%04X received=0x%04X)\n", rComputed, rReceived);
+    if (rReceived != crc16Modbus(resp, 6)) {
+        DBG_PRINTLN("[Emaux] writeRegister FAILED: CRC mismatch");
         return false;
     }
-
-    // A correct write echoes address + function code back
     bool ok = (resp[0] == pumpAddr && resp[1] == EMAUX_FC_WRITE);
     if (!ok) {
         DBG_PRINTF("[Emaux] writeRegister FAILED: unexpected echo (addr=0x%02X fc=0x%02X)%s\n",
-                   resp[0], resp[1], (resp[1] & 0x80) ? " -- looks like a Modbus exception response" : "");
+                   resp[0], resp[1], (resp[1] & 0x80) ? " -- Modbus exception" : "");
     } else {
         DBG_PRINTLN("[Emaux] writeRegister OK");
     }
@@ -399,132 +400,116 @@ inline bool emauxRun(uint8_t pumpId, bool run) {
 }
 
 // ============================================================
-//  Black & Decker (Modbus RTU write-single-register, FC 0x06, 38400 baud)
-//  pumpAddr follows the slot convention (pump N = address N), and since
-//  the pump is fixed at address 1, only slot 1 ever reaches this driver
-//  (enforced in the dispatcher below).
+//  Black & Decker (38400, Modbus FC06, FIRE-AND-FORGET)
 // ============================================================
-inline bool bdWriteRegister(uint8_t pumpAddr, uint16_t reg, uint16_t val) {
+// One setpoint write: speed to run, 0 to stop. Per spec, NO reply is
+// awaited and RX is never read for this pump — the frame goes out and
+// the state flag flips immediately ("sent" semantics, user-approved).
+inline void bdSendSpeed(uint8_t pumpId, uint16_t rpm) {
+    if (rpm > 0) {
+        if (rpm < BD_RPM_MIN) rpm = BD_RPM_MIN;
+        if (rpm > BD_RPM_MAX) rpm = BD_RPM_MAX;
+    }
     rs485UseBaud(BD_BAUD);
-    DBG_PRINTF("[B&D] pumpAddr=%u reg=0x%04X val=%u\n", pumpAddr, reg, val);
+    uint16_t val = (uint16_t)(rpm * BD_RPM_SCALE);
+    DBG_PRINTF("[B&D] pumpAddr=%u reg=0x%04X val=%u (%u rpm) — fire-and-forget x%d\n",
+               pumpId, BD_REG_SPEED, val, rpm, BD_SEND_REPEATS);
     uint8_t frame[8] = {
-        pumpAddr, BD_FC_WRITE,
-        (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF),
+        pumpId, BD_FC_WRITE,
+        (uint8_t)(BD_REG_SPEED >> 8), (uint8_t)(BD_REG_SPEED & 0xFF),
         (uint8_t)(val >> 8), (uint8_t)(val & 0xFF)
     };
-    uint16_t crc = emauxCrc(frame, 6); // standard Modbus CRC16 — shared
+    uint16_t crc = crc16Modbus(frame, 6);
     frame[6] = crc & 0xFF;
     frame[7] = (crc >> 8) & 0xFF;
-
-    rs485Send(frame, 8);
-
-    uint8_t resp[8];
-    uint8_t rlen = rs485Receive(resp, sizeof(resp));
-    if (rlen < 8) {
-        DBG_PRINTF("[B&D] writeRegister FAILED: short response (%u bytes, expected 8)\n", rlen);
-        return false;
+    for (uint8_t i = 0; i < BD_SEND_REPEATS; i++) {
+        if (i > 0) delay(BD_REPEAT_GAP_MS);
+        rs485Send(frame, 8);
     }
-    uint16_t rReceived = (uint16_t)resp[7] << 8 | resp[6];
-    uint16_t rComputed = emauxCrc(resp, 6);
-    if (rReceived != rComputed) {
-        DBG_PRINTF("[B&D] writeRegister FAILED: CRC mismatch (computed=0x%04X received=0x%04X)\n", rComputed, rReceived);
-        return false;
-    }
-    // A correct write echoes address + function code back
-    bool ok = (resp[0] == pumpAddr && resp[1] == BD_FC_WRITE);
-    if (!ok) {
-        DBG_PRINTF("[B&D] writeRegister FAILED: unexpected echo (addr=0x%02X fc=0x%02X)%s\n",
-                   resp[0], resp[1], (resp[1] & 0x80) ? " -- looks like a Modbus exception response" : "");
-    } else {
-        DBG_PRINTLN("[B&D] writeRegister OK");
-    }
-    return ok;
-}
-
-inline bool bdSetSpeed(uint8_t pumpId, uint16_t rpm) {
-    if (rpm < BD_RPM_MIN) rpm = BD_RPM_MIN;
-    if (rpm > BD_RPM_MAX) rpm = BD_RPM_MAX;
-    return bdWriteRegister(pumpId, BD_REG_SPEED, (uint16_t)(rpm * BD_RPM_SCALE));
-}
-
-inline bool bdRun(uint8_t pumpId, bool run) {
-    return bdWriteRegister(pumpId, BD_REG_RUN, run ? BD_RUN_CMD : BD_STOP_CMD);
+    // Deliberately no rs485Receive() here.
 }
 
 // ============================================================
-//  Unified dispatcher — called every loop tick from relay_timer.ino
-//  with the pump's *desired* state (from schedule or manual override).
-//
-//  Pump 1 -> RS485 address 1, Pump 2 -> address 2, Pump 3 -> address 3,
-//  Pump 4 -> address 4 (set each physical pump's address accordingly).
-//
-//  Only sends bus traffic when the desired state differs from what was
-//  last CONFIRMED applied, and only marks it confirmed once the pump
-//  acknowledges the command — so a dropped/failed frame is automatically
-//  retried on the next tick instead of silently being considered "done".
+//  Dispatcher — called every tick from relay_timer_latest.ino with each
+//  pump's desired state. Sends only when the desired state differs from
+//  the last applied one. Pentair/Emaux mark applied on the pump's
+//  acknowledgment (retrying silently otherwise); Black & Decker marks
+//  applied the moment the frame is sent.
 // ============================================================
 inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, uint16_t speed) {
-    if (pumpId < 1 || pumpId > MAX_PUMPS) {
-        DBG_PRINTF("[Dispatcher] IGNORED: pumpId %u out of range (1-%d)\n", pumpId, MAX_PUMPS);
-        return;
-    }
+    if (pumpId < 1 || pumpId > MAX_PUMPS) return;
     int idx = pumpId - 1;
 
-    // When commanding OFF, always talk to the pump using whatever protocol
-    // it was actually last driven with. The caller's pumpType can be stale
-    // here (e.g. RELAY_TIMER_1.ino falls back to the schedule's pumpType
-    // when there's no active preset, which defaults to PUMP_PENTAIR) --
-    // sending a stop frame in the wrong protocol never gets acknowledged,
-    // so the pump looks stuck "on" forever.
-    if (!run) {
-        uint8_t requestedType = pumpType;
-        pumpType = currentPumpStates[idx].type;
-        if (requestedType != pumpType) {
-            DBG_PRINTF("[Dispatcher] pump %u: overriding requested type %u with last-known type %u for STOP\n",
-                       pumpId, requestedType, pumpType);
-        }
-    }
+    // Commanding OFF uses the protocol the pump was actually last driven
+    // with — a stop frame in the wrong protocol never lands.
+    if (!run) pumpType = currentPumpStates[idx].type;
 
     bool alreadyApplied = (currentPumpStates[idx].active == run) &&
                           (!run || currentPumpStates[idx].speed == speed);
-    if (alreadyApplied) {
-        DBG_PRINTF("[Dispatcher] pump %u: state already applied (active=%d speed=%u), skipping\n",
-                   pumpId, currentPumpStates[idx].active, currentPumpStates[idx].speed);
-        return;
+    if (alreadyApplied) return;
+
+    // Print-on-change bookkeeping.
+    PumpLogMemo &memo = pumpLogMemo[idx];
+    bool desiredChanged = !memo.haveDesired || memo.run != run ||
+                          memo.speed != speed || memo.type != pumpType;
+    if (desiredChanged) {
+        memo.haveDesired = true;
+        memo.run = run;
+        memo.speed = speed;
+        memo.type = pumpType;
+        memo.failLogged = false;
     }
 
-    // Black & Decker exists on pump slot 1 only (fixed Modbus address 1).
-    // Every input path validates this already — this is the last line of
-    // defense so a mis-addressed command can never reach the bus.
+    // Black & Decker is pump-1-only (fixed bus address 1).
     if (pumpType == PUMP_BLACKDECKER && pumpId != 1) {
-        DBG_PRINTF("[Dispatcher] IGNORED: Black & Decker is only supported on pump 1 (got pump %u)\n", pumpId);
+        if (desiredChanged)
+            DBG_PRINTF("[Dispatcher] IGNORED: Black & Decker is only supported on pump 1 (got pump %u)\n", pumpId);
         return;
     }
 
     const char* typeName = (pumpType == PUMP_PENTAIR) ? "PENTAIR"
                          : (pumpType == PUMP_BLACKDECKER) ? "BLACK&DECKER" : "EMAUX";
-    DBG_PRINTF("[Dispatcher] pump %u: desired run=%d speed=%u type=%s (current active=%d speed=%u)\n",
-               pumpId, run, speed, typeName,
-               currentPumpStates[idx].active, currentPumpStates[idx].speed);
 
+    bool verboseAttempt = !memo.failLogged;
+    if (verboseAttempt && desiredChanged) {
+        DBG_PRINTF("[Dispatcher] pump %u: desired run=%d speed=%u type=%s (current active=%d speed=%u)\n",
+                   pumpId, run, speed, typeName,
+                   currentPumpStates[idx].active, currentPumpStates[idx].speed);
+    }
+
+    // ---- Black & Decker: open loop, applied on send ----------------
+    if (pumpType == PUMP_BLACKDECKER) {
+        bdSendSpeed(pumpId, run ? speed : 0);
+        currentPumpStates[idx].active = run;
+        currentPumpStates[idx].speed = run ? speed : 0;
+        currentPumpStates[idx].type = PUMP_BLACKDECKER;
+        DBG_PRINTF("[Dispatcher] pump %u: command SENT open-loop (active=%d speed=%u)\n",
+                   pumpId, currentPumpStates[idx].active, currentPumpStates[idx].speed);
+        return;
+    }
+
+    // ---- Pentair / Emaux: confirmed, silent retries ----------------
+#if RS485_DEBUG
+    bool dbgSave = rs485DebugEnabled;
+    if (!verboseAttempt) rs485DebugEnabled = false;
+#endif
     bool ok = true;
     if (pumpType == PUMP_PENTAIR) {
         if (!pentairEnsureControl(pumpId)) {
-            DBG_PRINTF("[Dispatcher] pump %u: Pentair control not yet taken, will retry next tick\n", pumpId);
-            return; // handshake not done yet, retry next tick
+#if RS485_DEBUG
+            rs485DebugEnabled = dbgSave;
+#endif
+            if (!memo.failLogged) {
+                memo.failLogged = true;
+                DBG_PRINTF("[Dispatcher] pump %u: Pentair control handshake pending — retrying silently\n", pumpId);
+            }
+            return;
         }
         if (run) {
             ok = pentairSetSpeed(pumpId, speed) && ok;
             ok = pentairRun(pumpId, true) && ok;
         } else {
             ok = pentairRun(pumpId, false) && ok;
-        }
-    } else if (pumpType == PUMP_BLACKDECKER) {
-        if (run) {
-            ok = bdSetSpeed(pumpId, speed) && ok;
-            ok = bdRun(pumpId, true) && ok;
-        } else {
-            ok = bdRun(pumpId, false) && ok;
         }
     } else { // PUMP_EMAUX
         if (run) {
@@ -534,18 +519,22 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
             ok = emauxRun(pumpId, false) && ok;
         }
     }
+#if RS485_DEBUG
+    rs485DebugEnabled = dbgSave;
+#endif
 
     if (ok) {
         currentPumpStates[idx].active = run;
         currentPumpStates[idx].speed = run ? speed : 0;
         if (run) currentPumpStates[idx].type = pumpType;
+        memo.failLogged = false;
         DBG_PRINTF("[Dispatcher] pump %u: state CONFIRMED applied (active=%d speed=%u)\n",
                    pumpId, currentPumpStates[idx].active, currentPumpStates[idx].speed);
-    } else {
-        DBG_PRINTF("[Dispatcher] pump %u: command FAILED, state left unchanged for retry next tick\n", pumpId);
+    } else if (!memo.failLogged) {
+        memo.failLogged = true;
+        DBG_PRINTF("[Dispatcher] pump %u: command FAILED — retrying silently until it confirms or the request changes\n",
+                   pumpId);
     }
-    // if !ok, currentPumpStates is left unchanged so the next loop tick
-    // sees the state as "not yet applied" and retries automatically.
 }
 
 // Read-only accessor for the web UI / status API.

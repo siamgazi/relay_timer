@@ -69,30 +69,30 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BarcodeScanningResult, CameraView, useCameraPermissions } from 'expo-camera';
 import React, {
-    createContext,
-    useCallback,
-    useContext,
-    useEffect,
-    useMemo,
-    useRef,
-    useState,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
 } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    Animated,
-    Modal,
-    PermissionsAndroid,
-    Platform,
-    SafeAreaView,
-    ScrollView,
-    StatusBar,
-    StyleSheet,
-    Switch,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Alert,
+  Animated,
+  Modal,
+  PermissionsAndroid,
+  Platform,
+  SafeAreaView,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Switch,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { BleManager, State as BleState, Device } from 'react-native-ble-plx';
 
@@ -1867,11 +1867,18 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   }, [sendCommand]);
 
   const setPumpModeFn = useCallback((id: number, mode: RelayMode) => {
-    // Mode is reflected optimistically, but `active` is NOT — the ON pill
-    // and RPM readout mean "the pump acknowledged over RS-485", which only
-    // the device's confirmed state can say. (Relays flip instantly; pumps
-    // have a hardware handshake that can lag or fail.)
-    setPumps((ps) => ps.map((p) => (p.id === id ? { ...p, mode } : p)));
+    // Mode is reflected optimistically. `active` stays confirmation-driven
+    // for Pentair/Emaux (their pill means "the pump acknowledged over
+    // RS-485") — but Black & Decker is fire-and-forget by design: no reply
+    // is ever read, the firmware marks it applied on send, so the pill
+    // flips right here on both ON and OFF ("sent" semantics).
+    setPumps((ps) => ps.map((p) => {
+      if (p.id !== id) return p;
+      if (p.pumpType === 'Black & Decker') {
+        return { ...p, mode, active: mode === 'on' ? true : mode === 'off' ? false : p.active };
+      }
+      return { ...p, mode };
+    }));
     sendCommand({ cmd: 'setPumpMode', id, mode });
   }, [sendCommand]);
 
@@ -2123,6 +2130,35 @@ function HomeScreen() {
   // can be told to run. Present in the map = picker open for that pump.
   const [pumpPicker, setPumpPicker] = useState<Record<number, { pumpType: PumpType; speed: string }>>({});
 
+  // Pumps whose "Turn on" was tapped but whose RS-485 acknowledgment
+  // hasn't come back yet (id -> tap timestamp). While pending, the Turn
+  // on button turns amber — "command sent, waiting for the pump".
+  // Cleared when the device confirms (active flips true) or after 20s.
+  const [pumpPending, setPumpPending] = useState<Record<number, number>>({});
+  useEffect(() => {
+    setPumpPending((prev) => {
+      const ids = Object.keys(prev);
+      if (ids.length === 0) return prev;
+      const next: Record<number, number> = { ...prev };
+      let changed = false;
+      for (const idStr of ids) {
+        const id = Number(idStr);
+        const pump = pumps.find((pp) => pp.id === id);
+        // Black & Decker pending is cleared by its own fixed 500ms timer
+        // (set in turnOn), not by confirmation — its pill flips
+        // optimistically, which would otherwise cancel the flash early.
+        if (pump?.pumpType === 'Black & Decker') continue;
+        if (pump?.active || Date.now() - prev[id] > 20000) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    // Runs on every state push (2-5s cadence), which is also often enough
+    // to enforce the 20s give-up without a dedicated timer.
+  }, [pumps]);
+
   const emptyForm = {
     target: 'Relay 1',
     pumpType: 'Pentair' as PumpType,
@@ -2228,6 +2264,7 @@ function HomeScreen() {
         <Text style={styles.secTitle}>PUMPS — MANUAL CONTROL</Text>
         {pumps.map((p) => {
           const draft = pumpPicker[p.id];
+          const pending = !!pumpPending[p.id];
           const seedSpeed = p.setSpeedRpm || p.speedRpm;
           const shownType = draft ? draft.pumpType : p.pumpType;
           const shownSpeed = draft ? draft.speed : String(seedSpeed || '');
@@ -2258,6 +2295,23 @@ function HomeScreen() {
             // RPM you set never vanishes from view.
             setPumpConfig(p.id, { pumpType: shownType, speedRpm: speed });
             setPumpMode(p.id, 'on');
+            setPumpPending((prev) => ({ ...prev, [p.id]: Date.now() }));
+            if (shownType === 'Black & Decker') {
+              // Fire-and-forget: no acknowledgment will ever come. Show
+              // "Turning on…" for a fixed 500ms as tap feedback, then the
+              // button returns to normal; the pill has already flipped ON
+              // optimistically via setPumpMode ("sent" semantics).
+              setTimeout(() => {
+                setPumpPending((prev) => {
+                  if (!(p.id in prev)) return prev;
+                  const next = { ...prev };
+                  delete next[p.id];
+                  return next;
+                });
+              }, 500);
+            }
+            // Other families: the amber state holds until the pump
+            // acknowledges (cleared by the effect above), or 20s.
           };
           return (
             <View key={p.id} style={styles.pumpItem}>
@@ -2289,6 +2343,13 @@ function HomeScreen() {
                     return;
                   }
                   closeDraft();
+                  // Leaving "on" cancels any waiting-for-ack state.
+                  setPumpPending((prev) => {
+                    if (!(p.id in prev)) return prev;
+                    const next = { ...prev };
+                    delete next[p.id];
+                    return next;
+                  });
                   setPumpMode(p.id, m);
                 }}
               />
@@ -2317,8 +2378,12 @@ function HomeScreen() {
                     <TouchableOpacity style={[styles.btnSec, { flex: 1 }]} onPress={closeDraft}>
                       <Text style={styles.btnSecTxt}>Cancel</Text>
                     </TouchableOpacity>
-                    <TouchableOpacity style={[styles.btnPrimary, { flex: 1 }]} onPress={turnOn}>
-                      <Text style={styles.btnPrimaryTxt}>Turn on</Text>
+                    <TouchableOpacity
+                      style={[styles.btnPrimary, { flex: 1 }, pending && { backgroundColor: '#d97706' }]}
+                      onPress={turnOn}
+                      disabled={pending}
+                    >
+                      <Text style={styles.btnPrimaryTxt}>{pending ? 'Turning on…' : 'Turn on'}</Text>
                     </TouchableOpacity>
                   </View>
                 </View>
