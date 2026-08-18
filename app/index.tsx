@@ -81,10 +81,10 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Easing,
   Modal,
   PermissionsAndroid,
   Platform,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -95,6 +95,8 @@ import {
   View,
 } from 'react-native';
 import { BleManager, State as BleState, Device } from 'react-native-ble-plx';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import Svg, { Circle as SvgCircle, Path as SvgPath, Rect as SvgRect } from 'react-native-svg';
 
 // ============================================================
 //  THEME  (ported from web_ui.h :root CSS variables)
@@ -245,6 +247,34 @@ const initialPresets: Preset[] = [
 ];
 
 const TARGET_OPTIONS = ['Relay 1', 'Relay 2', 'Relay 3', 'Pump 1', 'Pump 2', 'Pump 3', 'Pump 4'];
+
+// ============================================================
+//  FIRMWARE OTA  — the app checks this manifest on GitHub, compares its
+//  version against what the DEVICE reports, downloads the .bin, and
+//  pushes it to the controller's /update endpoint over the LAN.
+//  version.json shape: { "version": "1.1.0", "url": "https://github.com/<user>/<repo>/releases/download/v1.1.0/firmware.bin", "notes": "..." }
+// ============================================================
+const FW_MANIFEST_URL = 'https://raw.githubusercontent.com/siamgazi/relay-timer-firmware/main/version.json';
+
+// Only ONE firmware-update dialog may be presented at a time — a second
+// native Modal opened over an existing one is silently dropped by the OS
+// and can wedge an invisible, touch-eating layer over the screen.
+const fwUpdateUiOpen = { current: false };
+// Set after a successful update so the auto-prompt doesn't re-suggest the
+// same version while the app still holds that device's pre-reboot state.
+// Scoped to the device MAC: switching to ANOTHER device on an older
+// firmware must still trigger the suggestion.
+const fwJustUpdatedTo: { current: { mac: string; version: string } | null } = { current: null };
+
+// true when a is strictly newer than b ("1.2.0" vs "1.1.9")
+function versionNewer(a: string, b: string): boolean {
+  const pa = a.split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = b.split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+}
 
 // ============================================================
 //  base64 <-> utf8 helpers
@@ -530,8 +560,10 @@ async function httpFetch(ip: string, path: string, init?: RequestInit): Promise<
 }
 
 // Performs the challenge/auth exchange and returns a bearer token.
+// The nonce comes back too: Wi-Fi passwords sent over this transport are
+// encrypted against it, exactly like the BLE session nonce.
 // Throws if the device is unreachable or rejects our secret.
-async function httpAuthenticate(ip: string): Promise<{ token: string; mac: string }> {
+async function httpAuthenticate(ip: string): Promise<{ token: string; mac: string; nonce: string }> {
   const chalRes = await httpFetch(ip, '/challenge');
   if (!chalRes.ok) throw new Error(`challenge failed (${chalRes.status})`);
   const chal = await chalRes.json();
@@ -547,7 +579,7 @@ async function httpAuthenticate(ip: string): Promise<{ token: string; mac: strin
   const auth = await authRes.json();
   if (!auth?.token) throw new Error('no token issued');
 
-  return { token: auth.token, mac: chal.mac || '' };
+  return { token: auth.token, mac: chal.mac || '', nonce: chal.nonce };
 }
 
 async function httpGetState(ip: string, token: string): Promise<any> {
@@ -638,6 +670,9 @@ interface PoolContextValue {
   activeMac: string | null;
   activeDevice: DeviceRecord | null;
   transport: TransportKind | null;
+  bleUp: boolean;
+  deviceFw: string | null;
+  otaPerform: (binUrl: string, targetVersion: string, onPhase: (label: string, pct: number) => void) => Promise<void>;
   selectDevice: (mac: string) => Promise<void>;
   renameDevice: (mac: string, name: string) => Promise<void>;
   removeDevice: (mac: string) => Promise<void>;
@@ -741,6 +776,11 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
   const [activeMac, setActiveMac] = useState<string | null>(null);
   const [transport, setTransport] = useState<TransportKind | null>(null);
+  // True while a BLE link to the device is up, even when Wi-Fi is the
+  // active transport — drives the Bluetooth indicator on the Device tab.
+  const [bleUp, setBleUp] = useState(false);
+  // Firmware version the connected device reports in its state JSON.
+  const [deviceFw, setDeviceFw] = useState<string | null>(null);
 
   // ---- wi-fi ----
   const [wifi, setWifi] = useState<WifiStatus | null>(null);
@@ -750,7 +790,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   // The LAN transport's bearer token and the IP it belongs to. Held in a
   // ref because the polling loop and every command read it without
   // wanting to re-subscribe on each change.
-  const httpRef = useRef<{ ip: string; token: string } | null>(null);
+  const httpRef = useRef<{ ip: string; token: string; nonce: string } | null>(null);
   const transportRef = useRef<TransportKind | null>(null);
   const activeMacRef = useRef<string | null>(null);
   const devicesRef = useRef<DeviceRecord[]>([]);
@@ -841,6 +881,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         joinFailed: msg.wifi.joinFailed === true,
       });
     }
+    if (typeof msg.fwVersion === 'string' && msg.fwVersion.length > 0) setDeviceFw(msg.fwVersion);
     if (typeof msg.mac === 'string' && msg.mac.length > 0) {
       activeMacRef.current = msg.mac;
       setActiveMac(msg.mac);
@@ -972,6 +1013,24 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    // Per-network scan result frames (small single-notify messages that
+    // survive where the one big wifiScan push got torn over BLE). The
+    // list fills progressively; wifiScanEnd stops the spinner.
+    if (msg.type === 'wifiNet') {
+      if (typeof msg.ssid === 'string' && msg.ssid.length > 0) {
+        setWifiNetworks((prev) => {
+          const base = msg.i === 0 ? [] : prev;
+          if (base.some((n) => n.ssid === msg.ssid)) return base === prev ? prev : base;
+          return [...base, { ssid: msg.ssid, rssi: typeof msg.rssi === 'number' ? msg.rssi : -70, secure: msg.secure === true }];
+        });
+      }
+      return;
+    }
+    if (msg.type === 'wifiScanEnd') {
+      setWifiScanning(false);
+      return;
+    }
+
     if (msg.type === 'wifi') {
       // Deliberately unconditional (not just __DEV__): this line in the
       // Metro terminal, matched against the firmware's "[ble] wifi event ->
@@ -998,6 +1057,27 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
           lastIp: typeof msg.ip === 'string' && msg.ip ? msg.ip : undefined,
           ssid: msg.ssid || null,
         });
+      }
+      return;
+    }
+
+    // Pump confirmation frame — small single-notify message that survives
+    // where the big multi-chunk state push gets torn over BLE. This is
+    // what flips the pill / clears "Turning on…" promptly on Bluetooth.
+    if (msg.type === 'pump') {
+      if (typeof msg.id === 'number') {
+        setPumps((ps) =>
+          ps.map((p) =>
+            p.id === msg.id
+              ? {
+                  ...p,
+                  active: msg.active === true,
+                  speedRpm: typeof msg.speedRpm === 'number' ? msg.speedRpm : p.speedRpm,
+                  name: typeof msg.name === 'string' && msg.name ? msg.name : p.name,
+                }
+              : p
+          )
+        );
       }
       return;
     }
@@ -1043,6 +1123,8 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     const device = deviceRef.current;
     connectGenRef.current += 1; // invalidate every in-flight callback of the old session
     isConnectedRef.current = false;
+    setBleUp(false);
+    setDeviceFw(null); // stale pre-disconnect version must not drive update prompts
     isAuthedRef.current = false;
     authRef.current = null;
     connectInFlightRef.current = false;
@@ -1120,6 +1202,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
 
     deviceRef.current = connected;
     isConnectedRef.current = true;
+    setBleUp(true);
     isAuthedRef.current = false;
     rxBufferRef.current = '';
     setDeviceLabel(advertisedName);
@@ -1131,6 +1214,8 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       // not wipe the session that superseded it.
       if (connectGenRef.current !== myGen) return;
       isConnectedRef.current = false;
+      setBleUp(false);
+      setDeviceFw(null); // re-learned from the first state push after reconnect
       isAuthedRef.current = false;
       authRef.current?.settle(false, 'The controller closed the connection.');
       deviceRef.current = null;
@@ -1194,6 +1279,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       // can fall back (the stale-reuse path retries with a fresh scan) or
       // should surface the failure to the user.
       isConnectedRef.current = false;
+      setBleUp(false);
       isAuthedRef.current = false;
       try { await connected.cancelConnection(); } catch {}
       deviceRef.current = null;
@@ -1323,7 +1409,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   // BLE, which matches by advertised name and cannot mis-target.
   const connectHttp = useCallback(async (ip: string, expectedMac?: string): Promise<boolean> => {
     try {
-      const { token, mac } = await httpAuthenticate(ip);
+      const { token, mac, nonce } = await httpAuthenticate(ip);
       // A retry/promote tick that was already in flight when the user
       // removed this device would otherwise finish the connect and
       // re-register the record they just deleted (the serial log showed
@@ -1339,7 +1425,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         await upsertDevice({ mac: expectedMac, lastIp: null }); // stop retrying the stale address
         return false;
       }
-      httpRef.current = { ip, token };
+      httpRef.current = { ip, token, nonce };
 
       const state = await httpGetState(ip, token);
       applyRemoteState(state);
@@ -1599,44 +1685,103 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   // ============================================================
   const scanWifiNetworks = useCallback(async () => {
     const device = deviceRef.current;
-    if (!device || !isAuthedRef.current) {
-      setLastError('Connect over Bluetooth to set up Wi-Fi.');
-      return;
-    }
+    const http = httpRef.current;
     setWifiNetworks([]);
     setWifiScanning(true);
-    try {
-      await writeLine(device, { cmd: 'scanWifi' });
-    } catch (err: any) {
-      setWifiScanning(false);
-      setLastError(`Could not start Wi-Fi scan: ${err?.message || err}`);
+
+    // The device caches its latest scan at /wifiScan — polled as the
+    // result channel over HTTP, and as the safety net for the BLE push
+    // (a large multi-chunk message that radio contention can tear).
+    const pollResults = (h: { ip: string; token: string; nonce: string }) => {
+      const deadline = Date.now() + 20000;
+      const poll = async () => {
+        if (httpRef.current !== h) { setWifiScanning(false); return; }
+        try {
+          const res = await httpFetch(h.ip, '/wifiScan', { headers: { Authorization: `Bearer ${h.token}` } });
+          const json = await res.json();
+          if (Array.isArray(json?.networks)) {
+            setWifiNetworks(json.networks);
+            setWifiScanning(false);
+            return;
+          }
+        } catch { /* transient — keep polling until the deadline */ }
+        if (Date.now() < deadline) setTimeout(poll, 1500);
+        else setWifiScanning(false);
+      };
+      setTimeout(poll, 2500); // the device-side scan itself takes a couple of seconds
+    };
+
+    if (device && isAuthedRef.current) {
+      try {
+        await writeLine(device, { cmd: 'scanWifi' });
+      } catch (err: any) {
+        setWifiScanning(false);
+        setLastError(`Could not start Wi-Fi scan: ${err?.message || err}`);
+        return;
+      }
+      // Results arrive as a wifiScan push; the HTTP poll (when available)
+      // covers a torn push. Clear the spinner if nothing ever lands.
+      if (http) pollResults(http);
+      setTimeout(() => setWifiScanning(false), 20000);
       return;
     }
-    // The results arrive asynchronously as a wifiScan push. Clear the
-    // spinner if they never do, rather than leaving it spinning forever.
-    setTimeout(() => setWifiScanning(false), 20000);
+
+    if (http) {
+      try {
+        await httpSendCommand(http.ip, http.token, { cmd: 'scanWifi' });
+      } catch (err: any) {
+        setWifiScanning(false);
+        setLastError(`Could not start Wi-Fi scan: ${err?.message || err}`);
+        return;
+      }
+      pollResults(http);
+      return;
+    }
+
+    setWifiScanning(false);
+    setLastError('Connect to the device to scan for networks.');
   }, [writeLine]);
 
   const provisionWifi = useCallback(async (ssid: string, password: string) => {
     const device = deviceRef.current;
     const nonce = sessionNonceRef.current;
-    if (!device || !isAuthedRef.current || !nonce) {
-      setLastError('Connect over Bluetooth to set up Wi-Fi.');
+    if (device && isAuthedRef.current && nonce) {
+      try {
+        await writeLine(device, {
+          cmd: 'setWifi',
+          ssid,
+          // Encrypted against this session's nonce so the password is never
+          // exposed on air, independent of link-layer encryption.
+          passEnc: keystreamEncryptHex(nonce, password),
+          tzOffsetSec: -new Date().getTimezoneOffset() * 60,
+        });
+        setWifi({ state: 'connecting', ssid });
+      } catch (err: any) {
+        setLastError(`Could not send Wi-Fi credentials: ${err?.message || err}`);
+      }
       return;
     }
-    try {
-      await writeLine(device, {
-        cmd: 'setWifi',
-        ssid,
-        // Encrypted against this session's nonce so the password is never
-        // exposed on air, independent of link-layer encryption.
-        passEnc: keystreamEncryptHex(nonce, password),
-        tzOffsetSec: -new Date().getTimezoneOffset() * 60,
-      });
-      setWifi({ state: 'connecting', ssid });
-    } catch (err: any) {
-      setLastError(`Could not send Wi-Fi credentials: ${err?.message || err}`);
+
+    // No BLE link — provision over the LAN (encrypted against the HTTP
+    // auth nonce). Joining a different network drops this link mid-flight;
+    // the app's BLE fallback then picks the device back up.
+    const http = httpRef.current;
+    if (http) {
+      try {
+        await httpSendCommand(http.ip, http.token, {
+          cmd: 'setWifi',
+          ssid,
+          passEnc: keystreamEncryptHex(http.nonce, password),
+          tzOffsetSec: -new Date().getTimezoneOffset() * 60,
+        });
+        setWifi({ state: 'connecting', ssid });
+      } catch (err: any) {
+        setLastError(`Could not send Wi-Fi credentials: ${err?.message || err}`);
+      }
+      return;
     }
+
+    setLastError('Connect to the device to set up Wi-Fi.');
   }, [writeLine]);
 
   // Asks the device for fresh state over whichever transport is live.
@@ -1691,11 +1836,20 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   }, [wifi?.state, refreshState, connectWithQrData, disconnect]);
 
   const forgetWifi = useCallback(async () => {
+    // Deliver the command BEFORE tearing the LAN transport down — over
+    // BLE when that link is up, otherwise over the very network being
+    // forgotten (tearing down first silently dropped the command when
+    // the app was connected via Wi-Fi only).
+    const device = deviceRef.current;
+    const http = httpRef.current;
+    if (device && isAuthedRef.current) {
+      await writeLine(device, { cmd: 'forgetWifi' }).catch(() => {});
+    } else if (http) {
+      await httpSendCommand(http.ip, http.token, { cmd: 'forgetWifi' }).catch(() => {});
+    }
     stopHttpPolling();
     httpRef.current = null;
     if (transportRef.current === 'wifi') setTransportBoth(isAuthedRef.current ? 'ble' : null);
-    const device = deviceRef.current;
-    if (device && isAuthedRef.current) await writeLine(device, { cmd: 'forgetWifi' });
     // Reflect it immediately rather than waiting for the device's push —
     // the firmware's announce/state broadcast then confirms it. Without
     // this the UI kept showing the old network even though the device had
@@ -1705,6 +1859,85 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     const mac = activeMacRef.current;
     if (mac) await upsertDevice({ mac, lastIp: null, ssid: null });
   }, [writeLine, stopHttpPolling, setTransportBoth, upsertDevice]);
+
+  // ============================================================
+  //  FIRMWARE OTA — download the release image and push it to the
+  //  device's /update endpoint over the LAN. Independent of the current
+  //  transport: it authenticates its own HTTP session against the
+  //  device's IP, so it works even while the app is controlling via BLE
+  //  (as long as the phone is on the same network).
+  // ============================================================
+  const otaPerform = useCallback(async (
+    binUrl: string,
+    targetVersion: string,
+    onPhase: (label: string, pct: number) => void
+  ) => {
+    const ip = wifi?.ip
+      || (activeMacRef.current ? devicesRef.current.find((d) => d.mac === activeMacRef.current)?.lastIp : undefined);
+    if (!ip) throw new Error('No known IP address for this device — connect it to Wi-Fi first.');
+
+    onPhase('Checking the device on this network…', 0);
+    let pingMac = '';
+    try {
+      const res = await httpFetch(ip, '/ping');
+      const json = await res.json();
+      pingMac = json?.mac || '';
+    } catch {
+      throw new Error(`Can't reach the controller at ${ip}. Connect your phone to the same Wi-Fi network as the device (router client-isolation also blocks this).`);
+    }
+    if (activeMacRef.current && pingMac && pingMac !== activeMacRef.current)
+      throw new Error(`A different device answered at ${ip} — reconnect over Bluetooth to refresh its address.`);
+
+    const { token } = await httpAuthenticate(ip);
+
+    onPhase('Downloading firmware…', 0);
+    const dl = await fetch(binUrl);
+    if (!dl.ok) throw new Error(`Download failed (${dl.status}) — check the release URL.`);
+    const blob = await dl.blob();
+    if (blob.size < 100000) throw new Error('Downloaded file is too small to be a firmware image.');
+
+    onPhase('Uploading to device…', 0);
+    await new Promise<void>((resolve, reject) => {
+      // XHR instead of fetch for upload progress events.
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `http://${ip}/update`);
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      xhr.timeout = 120000;
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onPhase('Uploading to device…', e.loaded / e.total);
+      };
+      xhr.onload = () => {
+        try {
+          const json = JSON.parse(xhr.responseText);
+          if (xhr.status === 200 && json?.ok !== false) resolve();
+          else reject(new Error(json?.message || `Device rejected the update (${xhr.status}).`));
+        } catch {
+          xhr.status === 200 ? resolve() : reject(new Error(`Device rejected the update (${xhr.status}).`));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Upload failed — the connection to the device dropped.'));
+      xhr.ontimeout = () => reject(new Error('Upload timed out.'));
+      xhr.send(blob);
+    });
+
+    // The device verifies the image and reboots. Poll /ping until the NEW
+    // version answers — the proof the update actually took.
+    onPhase('Device is rebooting…', 1);
+    const deadline = Date.now() + 90000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3000));
+      try {
+        const res = await httpFetch(ip, '/ping');
+        const json = await res.json();
+        if (json?.fw === targetVersion) return;
+        if (typeof json?.fw === 'string') throw new Error(`Device came back reporting ${json.fw} — the update did not stick.`);
+      } catch (err: any) {
+        if (err?.message?.includes('did not stick')) throw err;
+        // still rebooting — keep polling
+      }
+    }
+    throw new Error('Device did not come back within 90s. Power-cycle it and check the firmware version — the previous firmware still boots if the update failed.');
+  }, [wifi?.ip]);
 
   // ============================================================
   //  DEVICE REGISTRY MANAGEMENT
@@ -1841,6 +2074,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     } catch {}
     deviceRef.current = null;
     isConnectedRef.current = false;
+    setBleUp(false);
     isAuthedRef.current = false;
     authRef.current = null;
     connectInFlightRef.current = false;
@@ -1946,7 +2180,8 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
 
   const value: PoolContextValue = {
     relays, pumps, presets, status, deviceLabel, lastError,
-    devices, activeMac, activeDevice, transport,
+    devices, activeMac, activeDevice, transport, bleUp,
+    deviceFw, otaPerform,
     selectDevice, renameDevice, removeDevice,
     wifi, wifiNetworks, wifiScanning, scanWifiNetworks, provisionWifi, forgetWifi, refreshState,
     connectWithQrData, disconnect, forceReset,
@@ -2010,11 +2245,158 @@ function Segmented({ value, onChange }: { value: RelayMode; onChange: (m: RelayM
   );
 }
 
+// ============================================================
+//  WHEEL PICKER — iOS Clock-style snap wheel. Pure ScrollView, no
+//  native dependency, so it looks identical on Android and iOS.
+// ============================================================
+const WHEEL_ITEM_H = 36;
+const WHEEL_ROWS = 5; // visible rows — odd, so one row sits dead center
+function WheelPicker({ items, index, onChange, width, rows = WHEEL_ROWS }: {
+  items: string[]; index: number; onChange: (i: number) => void; width: number; rows?: number;
+}) {
+  const ref = useRef<ScrollView | null>(null);
+  const lastEmitted = useRef(index);
+  const pad = ((rows - 1) / 2) * WHEEL_ITEM_H;
+  // The row currently sitting in the center band, tracked LIVE while the
+  // wheel scrolls — the bold highlight follows the finger, not just the
+  // final settled value.
+  const [centerIdx, setCenterIdx] = useState(index);
+
+  // Initial position (the contentOffset prop is unreliable on Android).
+  useEffect(() => {
+    requestAnimationFrame(() => ref.current?.scrollTo({ y: lastEmitted.current * WHEEL_ITEM_H, animated: false }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // External form changes (opening the editor on an existing schedule)
+  // move the wheel; values the wheel itself reported are not re-applied.
+  useEffect(() => {
+    if (index !== lastEmitted.current) {
+      lastEmitted.current = index;
+      setCenterIdx(index);
+      ref.current?.scrollTo({ y: index * WHEEL_ITEM_H, animated: false });
+    }
+  }, [index]);
+
+  const settle = (y: number) => {
+    let i = Math.round(y / WHEEL_ITEM_H);
+    i = Math.max(0, Math.min(items.length - 1, i));
+    if (i !== lastEmitted.current) {
+      lastEmitted.current = i;
+      onChange(i);
+    }
+  };
+
+  return (
+    <View style={{ width, height: WHEEL_ITEM_H * rows }}>
+      <View pointerEvents="none" style={{ position: 'absolute', top: pad, left: 2, right: 2, height: WHEEL_ITEM_H, borderRadius: 8, backgroundColor: 'rgba(15,23,42,0.05)' }} />
+      <ScrollView
+        ref={ref}
+        showsVerticalScrollIndicator={false}
+        snapToInterval={WHEEL_ITEM_H}
+        decelerationRate="fast"
+        nestedScrollEnabled
+        scrollEventThrottle={16}
+        onScroll={(e) => {
+          let i = Math.round(e.nativeEvent.contentOffset.y / WHEEL_ITEM_H);
+          i = Math.max(0, Math.min(items.length - 1, i));
+          setCenterIdx(i);
+        }}
+        onMomentumScrollEnd={(e) => settle(e.nativeEvent.contentOffset.y)}
+        contentContainerStyle={{ paddingVertical: pad }}
+      >
+        {items.map((it, i) => (
+          <View key={i} style={{ height: WHEEL_ITEM_H, alignItems: 'center', justifyContent: 'center' }}>
+            <Text style={{ fontSize: 20, fontWeight: i === centerIdx ? '700' : '400', color: i === centerIdx ? COLORS.text : '#b6bcc8' }}>
+              {it}
+            </Text>
+          </View>
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+const WHEEL_H12 = Array.from({ length: 12 }, (_, i) => String(i + 1));
+const WHEEL_M60 = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0'));
+const WHEEL_H24 = Array.from({ length: 24 }, (_, i) => String(i));
+
+// ============================================================
+//  SLIDE-UP MODAL — the native "slide" animation moves the dimmed
+//  backdrop up together with the sheet, which reads as a glitch. Here
+//  the backdrop FADES while the content slides on an eased curve, and
+//  the modal unmounts only after the closing animation finishes.
+// ============================================================
+// How many native modals are currently presented. Programmatic popups
+// (the firmware-update prompt) defer while this is non-zero: presenting a
+// second Modal over one that is opening/closing gets silently dropped by
+// the OS and can wedge an invisible, touch-eating layer over the app.
+const modalDepth = { current: 0 };
+
+function SlideUpModal({ visible, onClose, children, overlayStyle, distance = 640, closeOnBackdrop = true }: {
+  visible: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+  overlayStyle?: object;
+  distance?: number;
+  closeOnBackdrop?: boolean;
+}) {
+  const [mounted, setMounted] = useState(visible);
+  const anim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (visible) {
+      setMounted(true);
+      Animated.timing(anim, { toValue: 1, duration: 280, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+    } else {
+      Animated.timing(anim, { toValue: 0, duration: 220, easing: Easing.in(Easing.cubic), useNativeDriver: true }).start(({ finished }) => {
+        if (finished) setMounted(false);
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
+
+  // Watchdog: if the closing animation's completion callback is ever lost
+  // (interrupted animation, re-render storm at close time), the modal MUST
+  // still dismiss — a lingering transparent Modal eats every touch.
+  useEffect(() => {
+    if (visible || !mounted) return;
+    const t = setTimeout(() => setMounted(false), 400);
+    return () => clearTimeout(t);
+  }, [visible, mounted]);
+
+  useEffect(() => {
+    if (!mounted) return;
+    modalDepth.current += 1;
+    return () => { modalDepth.current -= 1; };
+  }, [mounted]);
+
+  // The Modal element stays in the tree and dismisses via its `visible`
+  // prop — the reliable native path. Unmounting a presented Modal (the
+  // old approach) intermittently leaked a touch-blocking layer on Android.
+  return (
+    <Modal visible={mounted} transparent animationType="none" onRequestClose={onClose}>
+      <Animated.View style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(15,23,42,0.5)', opacity: anim }]}>
+        <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={closeOnBackdrop ? onClose : undefined} />
+      </Animated.View>
+      <Animated.View
+        pointerEvents="box-none"
+        style={[
+          { flex: 1, justifyContent: 'flex-end' },
+          overlayStyle,
+          { transform: [{ translateY: anim.interpolate({ inputRange: [0, 1], outputRange: [distance, 0] }) }] },
+        ]}
+      >
+        {children}
+      </Animated.View>
+    </Modal>
+  );
+}
+
 // SPA LITE and POOL LITE describe lighting circuits — the firmware only
 // allows them on relays, so the pump picker hides them (as the web UI did).
 const RELAY_ONLY_NAMES = ['SPA LITE', 'POOL LITE'];
 
-function NamePicker({ value, onChange, extraOptionsDisabled, forPump }: { value: string; onChange: (v: string) => void; extraOptionsDisabled?: string[]; forPump?: boolean }) {
+function NamePicker({ value, onChange, extraOptionsDisabled, forPump, defaultLabel }: { value: string; onChange: (v: string) => void; extraOptionsDisabled?: string[]; forPump?: boolean; defaultLabel: string }) {
   const [open, setOpen] = useState(false);
   const options = forPump ? NAME_OPTIONS.filter((n) => !RELAY_ONLY_NAMES.includes(n)) : NAME_OPTIONS;
   return (
@@ -2022,12 +2404,14 @@ function NamePicker({ value, onChange, extraOptionsDisabled, forPump }: { value:
       <TouchableOpacity style={styles.fc} onPress={() => setOpen(true)}>
         <Text style={{ color: COLORS.text }}>{value}</Text>
       </TouchableOpacity>
-      <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
-        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setOpen(false)}>
-          <View style={styles.pickerSheet}>
+      <SlideUpModal visible={open} onClose={() => setOpen(false)}>
+        <View style={styles.pickerSheet}>
             <Text style={styles.modalTitle}>Choose a name</Text>
             <ScrollView style={{ maxHeight: 320 }}>
-              <PickerRow label="Default" selected={value === 'Default'} onPress={() => { onChange('Default'); setOpen(false); }} />
+              {/* The slot's own label ("Relay 1", "Pump 2") replaces the old
+                  generic "Default" option, and reads as selected when the
+                  slot carries no custom name. */}
+              <PickerRow label={defaultLabel} selected={value === defaultLabel} onPress={() => { onChange(defaultLabel); setOpen(false); }} />
               {options.map((n) => {
                 const disabled = extraOptionsDisabled?.includes(n);
                 return (
@@ -2036,9 +2420,8 @@ function NamePicker({ value, onChange, extraOptionsDisabled, forPump }: { value:
                 );
               })}
             </ScrollView>
-          </View>
-        </TouchableOpacity>
-      </Modal>
+        </View>
+      </SlideUpModal>
     </>
   );
 }
@@ -2063,16 +2446,14 @@ function PumpTypePicker({ value, onChange, allowBlackDecker }: { value: PumpType
       <TouchableOpacity style={styles.fc} onPress={() => setOpen(true)}>
         <Text style={{ color: COLORS.text }}>{value}  ▾</Text>
       </TouchableOpacity>
-      <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
-        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setOpen(false)}>
-          <View style={styles.pickerSheet}>
+      <SlideUpModal visible={open} onClose={() => setOpen(false)}>
+        <View style={styles.pickerSheet}>
             <Text style={styles.modalTitle}>Pump type</Text>
             {options.map((t) => (
               <PickerRow key={t} label={t} selected={value === t} onPress={() => { onChange(t); setOpen(false); }} />
             ))}
-          </View>
-        </TouchableOpacity>
-      </Modal>
+        </View>
+      </SlideUpModal>
     </>
   );
 }
@@ -2082,7 +2463,7 @@ function PumpTypePicker({ value, onChange, allowBlackDecker }: { value: PumpType
 // ============================================================
 function HomeScreen() {
   const {
-    relays, pumps, presets, status, deviceLabel,
+    relays, pumps, presets, status, deviceLabel, activeDevice,
     setRelayMode, setRelayName, setPumpMode, setPumpConfig,
     addSchedule, updateSchedule, deleteSchedule, toggleSchedule,
     r2Depends, setRelay2Dependency,
@@ -2121,8 +2502,23 @@ function HomeScreen() {
 
   const usedNames = useMemo(
     () => [...relays.map((r) => r.name), ...pumps.map((p) => p.name)].filter((n) => n !== 'Default' && !/^Relay \d$/.test(n) && !/^Pump \d$/.test(n)),
+
     [relays, pumps]
   );
+
+  // Schedules address targets by their canonical slot ("Relay 1", "Pump 2"),
+  // but everywhere the user SEES a target it wears its assigned name.
+  const targetName = (t: string) => {
+    const rm = t.match(/^Relay (\d)$/);
+    if (rm) return relays.find((r) => r.id === Number(rm[1]))?.name || t;
+    const pm = t.match(/^Pump (\d)$/);
+    if (pm) {
+      const p = pumps.find((pp) => pp.id === Number(pm[1]));
+      return p && !/^(Pump |PUMP)\d$/.test(p.name) ? p.name : t;
+    }
+    return t;
+  };
+  const [targetOpen, setTargetOpen] = useState(false);
 
   // Per-pump inline picker drafts (mirrors web_ui.h's pumpPickerOpen).
   // Tapping "On" only opens the picker — NOTHING is sent to the device
@@ -2182,6 +2578,21 @@ function HomeScreen() {
   };
   const [form, setForm] = useState(emptyForm);
 
+  // RPM wheel for the schedule editor: 10-rpm steps across the selected
+  // pump family's valid envelope (same limits the firmware enforces).
+  const rpmRange = form.pumpType === 'Pentair'
+    ? { min: 450, max: 3450 }
+    : form.pumpType === 'Black & Decker'
+      ? { min: 600, max: 3450 }
+      : { min: 800, max: 3400 };
+  const rpmItems = useMemo(() => {
+    const arr: string[] = [];
+    for (let v = rpmRange.min; v <= rpmRange.max; v += 10) arr.push(String(v));
+    return arr;
+  }, [rpmRange.min, rpmRange.max]);
+  const rpmIndex = Math.max(0, Math.min(rpmItems.length - 1,
+    Math.round(((parseInt(form.speed, 10) || rpmRange.min) - rpmRange.min) / 10)));
+
   const openAdd = () => { setEditingId(null); setForm(emptyForm); setModalOpen(true); };
   const openEdit = (p: Preset) => {
     setEditingId(p.id);
@@ -2231,7 +2642,10 @@ function HomeScreen() {
         <View style={styles.chip}>
           <Animated.View style={[styles.statusDot, { opacity: blink, backgroundColor: status === 'connected' ? COLORS.on : COLORS.label }]} />
           <Text style={styles.chipTxt}>
-            {status === 'connected' ? `Connected · ${deviceLabel}`
+            {/* The user-assigned registry name, live through renames — the
+                raw advertised-name snapshot was stale after a rename and
+                literally "null" on Wi-Fi-only connects. */}
+            {status === 'connected' ? `Connected · ${activeDevice?.name || deviceLabel || 'device'}`
               : status === 'authenticating' ? 'Verifying device…'
               : status === 'connecting' ? 'Connecting…'
               : 'Not connected (demo mode)'}
@@ -2251,8 +2665,9 @@ function HomeScreen() {
           <Text style={[styles.rName, { color: '#000' }]}>{r.name}</Text>
           <View style={{ marginVertical: 6 }}>
             <NamePicker
-              value={r.name.match(/^Relay \d$/) ? 'Default' : r.name}
-              onChange={(v) => setRelayName(r.id, v === 'Default' ? `Relay ${r.id}` : v)}
+              value={r.name}
+              defaultLabel={`Relay ${r.id}`}
+              onChange={(v) => setRelayName(r.id, v)}
               extraOptionsDisabled={usedNames}
             />
           </View>
@@ -2335,8 +2750,9 @@ function HomeScreen() {
               <Text style={[styles.rName, { color: '#000' }]}>{p.name}</Text>
               <View style={{ marginVertical: 6 }}>
                 <NamePicker
-                  value={p.name.match(/^(Pump |PUMP)\d$/) ? 'Default' : p.name}
-                  onChange={(v) => setPumpConfig(p.id, { name: v === 'Default' ? `Pump ${p.id}` : v })}
+                  value={p.name.match(/^(Pump |PUMP)\d$/) ? `Pump ${p.id}` : p.name}
+                  defaultLabel={`Pump ${p.id}`}
+                  onChange={(v) => setPumpConfig(p.id, { name: v })}
                   extraOptionsDisabled={usedNames}
                   forPump
                 />
@@ -2420,15 +2836,15 @@ function HomeScreen() {
             <View style={{ flex: 1, marginLeft: 12 }}>
               <Text style={{ fontWeight: '700' }}>{p.timeStr} · +{p.durationStr}</Text>
               <Text style={{ color: COLORS.muted, fontSize: 13 }}>
-                {p.targetLabel}
+                {targetName(p.targetLabel)}
                 {p.targetLabel.startsWith('Pump') ? ` · ${p.pumpType} @ ${p.speedRpm} RPM` : ''}
               </Text>
             </View>
             <TouchableOpacity style={styles.pBtn} onPress={() => openEdit(p)}>
-              <Text>✎</Text>
+              <FigIcon name="pencil" size={22} color={COLORS.text} />
             </TouchableOpacity>
             <TouchableOpacity style={styles.pBtn} onPress={() => deleteSchedule(p.id)}>
-              <Text style={{ color: '#dc2626' }}>×</Text>
+              <FigIcon name="trash" size={22} color="#dc2626" />
             </TouchableOpacity>
           </View>
         ))}
@@ -2439,59 +2855,127 @@ function HomeScreen() {
       </Card>
 
       {/* ---- Add/Edit Schedule modal ---- */}
-      <Modal visible={modalOpen} transparent animationType="slide" onRequestClose={() => setModalOpen(false)}>
-        <View style={styles.modalOverlay}>
-          <ScrollView style={styles.modalCard} contentContainerStyle={{ paddingBottom: 20 }}>
+      <SlideUpModal visible={modalOpen} onClose={() => setModalOpen(false)} closeOnBackdrop={false}>
+        <ScrollView style={styles.modalCard} contentContainerStyle={{ paddingBottom: 20 }}>
             <Text style={styles.modalTitle}>{editingId ? 'Edit Schedule' : 'Setup Schedule'}</Text>
 
             <Text style={styles.fieldLabel}>Target Device</Text>
-            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 6 }}>
-              {TARGET_OPTIONS.map((t) => (
-                <TouchableOpacity
-                  key={t}
-                  style={[styles.chipOption, form.target === t && styles.chipOptionActive]}
-                  onPress={() => setForm((f) => ({
-                    ...f,
-                    target: t,
-                    // Black & Decker is Pump-1-only — moving the target off
-                    // Pump 1 falls back to Pentair, matching the firmware rule.
-                    pumpType: t !== 'Pump 1' && f.pumpType === 'Black & Decker' ? 'Pentair' : f.pumpType,
-                  }))}
-                >
-                  <Text style={[styles.chipOptionTxt, form.target === t && styles.chipOptionTxtActive]}>{t}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
+            <TouchableOpacity style={styles.fc} onPress={() => setTargetOpen(true)}>
+              <Text style={{ color: COLORS.text }}>{targetName(form.target)}  ▾</Text>
+            </TouchableOpacity>
             <Text style={styles.fhint}>Select the hardware device you want this timer to activate.</Text>
 
+            <SlideUpModal visible={targetOpen} onClose={() => setTargetOpen(false)}>
+              <View style={styles.pickerSheet}>
+                <Text style={styles.modalTitle}>Target device</Text>
+                  <ScrollView style={{ maxHeight: 320 }}>
+                    {TARGET_OPTIONS.map((t) => (
+                      <PickerRow
+                        key={t}
+                        label={targetName(t)}
+                        selected={form.target === t}
+                        onPress={() => {
+                          setForm((f) => ({
+                            ...f,
+                            target: t,
+                            // Black & Decker is Pump-1-only — moving the target off
+                            // Pump 1 falls back to Pentair, matching the firmware rule.
+                            pumpType: t !== 'Pump 1' && f.pumpType === 'Black & Decker' ? 'Pentair' : f.pumpType,
+                          }));
+                          setTargetOpen(false);
+                        }}
+                      />
+                    ))}
+                  </ScrollView>
+              </View>
+            </SlideUpModal>
+
             {isPumpTarget && (
-              <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
-                <View style={{ flex: 1 }}>
+              <>
+                <View style={{ marginTop: 14 }}>
                   <PumpTypePicker
                     value={form.pumpType}
-                    onChange={(t) => setForm((f) => ({ ...f, pumpType: t }))}
+                    onChange={(t) => setForm((f) => {
+                      // Snap the speed into the new family's envelope on a
+                      // 10-rpm grid so the wheel and the value always agree.
+                      const r = t === 'Pentair' ? { min: 450, max: 3450 }
+                        : t === 'Black & Decker' ? { min: 600, max: 3450 }
+                        : { min: 800, max: 3400 };
+                      let sp = parseInt(f.speed, 10) || r.min;
+                      sp = Math.max(r.min, Math.min(r.max, Math.round(sp / 10) * 10));
+                      return { ...f, pumpType: t, speed: String(sp) };
+                    })}
                     allowBlackDecker={form.target === 'Pump 1'}
                   />
                 </View>
-                <TextInput style={[styles.fc, { flex: 1 }]} keyboardType="numeric" placeholder="Speed (RPM)" value={form.speed} onChangeText={(t) => setForm((f) => ({ ...f, speed: t }))} />
-              </View>
+              </>
             )}
 
-            <Text style={styles.fieldLabel}>Start Time</Text>
+            {/* Start time + speed side by side, 3-row wheels — the whole
+                editor fits on screen without scrolling. */}
             <View style={{ flexDirection: 'row', gap: 8 }}>
-              <TextInput style={[styles.fc, { flex: 1 }]} keyboardType="numeric" placeholder="Hour (1-12)" value={form.hour} onChangeText={(t) => setForm((f) => ({ ...f, hour: t }))} />
-              <TextInput style={[styles.fc, { flex: 1 }]} keyboardType="numeric" placeholder="Min (0-59)" value={form.minute} onChangeText={(t) => setForm((f) => ({ ...f, minute: t }))} />
-              <TouchableOpacity style={[styles.fc, { flex: 1, alignItems: 'center' }]} onPress={() => setForm((f) => ({ ...f, ampm: f.ampm === 'AM' ? 'PM' : 'AM' }))}>
-                <Text>{form.ampm}</Text>
-              </TouchableOpacity>
+              <View style={{ flex: 1.5 }}>
+                <Text style={styles.fieldLabel}>Start Time</Text>
+                <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center' }}>
+                  <WheelPicker
+                    width={44}
+                    rows={5}
+                    items={WHEEL_H12}
+                    index={Math.max(0, Math.min(11, (parseInt(form.hour, 10) || 12) - 1))}
+                    onChange={(i) => setForm((f) => ({ ...f, hour: WHEEL_H12[i] }))}
+                  />
+                  <Text style={{ fontSize: 18, fontWeight: '700', color: COLORS.text }}>:</Text>
+                  <WheelPicker
+                    width={44}
+                    rows={5}
+                    items={WHEEL_M60}
+                    index={Math.max(0, Math.min(59, parseInt(form.minute, 10) || 0))}
+                    onChange={(i) => setForm((f) => ({ ...f, minute: WHEEL_M60[i] }))}
+                  />
+                  <WheelPicker
+                    width={48}
+                    rows={5}
+                    items={['AM', 'PM']}
+                    index={form.ampm === 'PM' ? 1 : 0}
+                    onChange={(i) => setForm((f) => ({ ...f, ampm: i === 1 ? 'PM' : 'AM' }))}
+                  />
+                </View>
+              </View>
+              {isPumpTarget && (
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.fieldLabel}>Speed (RPM)</Text>
+                  <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center' }}>
+                    <WheelPicker
+                      width={74}
+                      rows={5}
+                      items={rpmItems}
+                      index={rpmIndex}
+                      onChange={(i) => setForm((f) => ({ ...f, speed: rpmItems[i] }))}
+                    />
+                  </View>
+                </View>
+              )}
             </View>
 
             <Text style={styles.fieldLabel}>Duration</Text>
-            <View style={{ flexDirection: 'row', gap: 8 }}>
-              <TextInput style={[styles.fc, { flex: 1 }]} keyboardType="numeric" placeholder="Hours" value={form.durH} onChangeText={(t) => setForm((f) => ({ ...f, durH: t }))} />
-              <TextInput style={[styles.fc, { flex: 1 }]} keyboardType="numeric" placeholder="Minutes" value={form.durM} onChangeText={(t) => setForm((f) => ({ ...f, durM: t }))} />
+            <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 6 }}>
+              <WheelPicker
+                width={56}
+                rows={5}
+                items={WHEEL_H24}
+                index={Math.max(0, Math.min(23, parseInt(form.durH, 10) || 0))}
+                onChange={(i) => setForm((f) => ({ ...f, durH: WHEEL_H24[i] }))}
+              />
+              <Text style={{ fontSize: 13, color: COLORS.muted }}>hours</Text>
+              <WheelPicker
+                width={56}
+                rows={5}
+                items={WHEEL_M60}
+                index={Math.max(0, Math.min(59, parseInt(form.durM, 10) || 0))}
+                onChange={(i) => setForm((f) => ({ ...f, durM: WHEEL_M60[i] }))}
+              />
+              <Text style={{ fontSize: 13, color: COLORS.muted }}>min</Text>
             </View>
-            <Text style={styles.fhint}>Set the exact duration the device should remain active.</Text>
 
             <View style={styles.rTop}>
               <Text style={styles.fieldLabel}>Enabled</Text>
@@ -2506,9 +2990,8 @@ function HomeScreen() {
                 <Text style={styles.btnPrimaryTxt}>Save Schedule</Text>
               </TouchableOpacity>
             </View>
-          </ScrollView>
-        </View>
-      </Modal>
+        </ScrollView>
+      </SlideUpModal>
     </ScrollView>
   );
 }
@@ -2533,6 +3016,12 @@ function QrScannerModal({ visible, onClose, onScanned }: { visible: boolean; onC
       if (!permission?.granted) requestPermission();
     }
   }, [visible]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!visible) return;
+    modalDepth.current += 1;
+    return () => { modalDepth.current -= 1; };
+  }, [visible]);
 
   const handleBarcode = (result: BarcodeScanningResult) => {
     if (handledRef.current) return;
@@ -2591,7 +3080,7 @@ function signalBars(rssi: number): string {
 type WifiStep = 'pick' | 'password' | 'joining' | 'done' | 'failed';
 
 function WifiSetupModal({ visible, onClose, notice }: { visible: boolean; onClose: () => void; notice?: string | null }) {
-  const { wifi, wifiNetworks, wifiScanning, scanWifiNetworks, provisionWifi } = usePool();
+  const { wifi, wifiNetworks, wifiScanning, scanWifiNetworks, provisionWifi, forgetWifi } = usePool();
   const [step, setStep] = useState<WifiStep>('pick');
   const [selected, setSelected] = useState<WifiNetwork | null>(null);
   const [password, setPassword] = useState('');
@@ -2606,12 +3095,18 @@ function WifiSetupModal({ visible, onClose, notice }: { visible: boolean; onClos
   // locally by provisionWifi right after the credentials are written).
   const joinArmedRef = useRef(false);
 
+  // Whether the device was ALREADY online when the sheet opened. In that
+  // case this is the "manage my network" flow (opened from the Wi-Fi
+  // button) — being online is the starting point, not a verdict to act on.
+  const openedOnlineRef = useRef(false);
+
   useEffect(() => {
     if (visible) {
       setStep('pick');
       setSelected(null);
       setPassword('');
       setShowPassword(false);
+      openedOnlineRef.current = wifi?.state === 'online';
       scanWifiNetworks();
     }
   }, [visible]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -2645,14 +3140,21 @@ function WifiSetupModal({ visible, onClose, notice }: { visible: boolean; onClos
     return () => clearTimeout(timer);
   }, [step]);
 
-  // The device came online while the user was still picking a network or
+  // The device CAME online while the user was still picking a network or
   // typing a password (its stored network or a background join attempt
   // succeeded). The question this popup asks has been answered — leave
   // immediately instead of letting the user re-provision a working device.
+  // Deliberately a transition detector: when the sheet was OPENED on an
+  // online device (managing/changing the network), staying online must
+  // not slam the sheet shut in the same frame it appeared.
   useEffect(() => {
     if (!visible) return;
     if (step !== 'pick' && step !== 'password') return;
-    if (wifi?.state === 'online') onClose();
+    if (wifi?.state !== 'online') {
+      openedOnlineRef.current = false; // from here, reaching online again IS a fresh join
+      return;
+    }
+    if (!openedOnlineRef.current) onClose();
   }, [visible, step, wifi?.state, onClose]);
 
   const submit = async () => {
@@ -2665,8 +3167,7 @@ function WifiSetupModal({ visible, onClose, notice }: { visible: boolean; onClos
   const canConnect = !!selected && (!selected.secure || password.length > 0);
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <View style={styles.modalOverlay}>
+    <SlideUpModal visible={visible} onClose={onClose}>
         <View style={[styles.modalCard, { minHeight: 440 }]}>
 
           {/* ---------- STEP 1: pick a network ---------- */}
@@ -2690,6 +3191,20 @@ function WifiSetupModal({ visible, onClose, notice }: { visible: boolean; onClos
                   Bluetooth keeps working as a fallback either way.
                 </Text>
               )}
+
+              {/* Currently connected network, with the forget action */}
+              {wifi?.state === 'online' && wifi.ssid ? (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 12, padding: 12, backgroundColor: 'rgba(34,197,94,0.08)', borderRadius: 12, borderWidth: 1, borderColor: 'rgba(34,197,94,0.25)' }}>
+                  <FigIcon name="wifi" size={18} color="#22c55e" />
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }} numberOfLines={1}>{wifi.ssid}</Text>
+                    <Text style={{ fontSize: 12, color: '#22c55e', fontWeight: '600' }}>Connected</Text>
+                  </View>
+                  <TouchableOpacity onPress={() => { forgetWifi(); onClose(); }}>
+                    <Text style={{ color: COLORS.danger, fontSize: 13, fontWeight: '600' }}>Forget</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : null}
 
               <ScrollView style={{ maxHeight: 290, marginVertical: 12 }}>
                 {wifiScanning && wifiNetworks.length === 0 && (
@@ -2826,18 +3341,128 @@ function WifiSetupModal({ visible, onClose, notice }: { visible: boolean; onClos
             </View>
           )}
         </View>
-      </View>
-    </Modal>
+    </SlideUpModal>
   );
 }
 
 // ============================================================
 //  DEVICE SWITCHER  (top-left of the Device tab)
 // ============================================================
+
+// Palette + shared fragments for the Device tab's Figma design
+// (https://pun-vast-23582148.figma.site/ — replicated 1:1).
+const FIG = {
+  green: '#22c55e', text: '#111827', gray: '#4b5563', muted: '#9ca3af',
+  bg: '#f9fafb', border: '#e5e7eb', white: '#ffffff', blue: '#3b82f6', red: '#ef4444',
+} as const;
+const figCard = {
+  backgroundColor: FIG.white, borderRadius: 16, borderWidth: 1, borderColor: FIG.border,
+  paddingVertical: 18, paddingHorizontal: 16, marginBottom: 16,
+  shadowColor: '#000', shadowOpacity: 0.07, shadowRadius: 4, shadowOffset: { width: 0, height: 1 }, elevation: 2,
+} as const;
+const figTile = {
+  flex: 1, backgroundColor: FIG.bg, borderRadius: 12,
+  paddingVertical: 12, paddingHorizontal: 12, borderWidth: 1, borderColor: FIG.border,
+} as const;
+const figSection = {
+  fontSize: 11, fontWeight: '600', color: FIG.muted, letterSpacing: 1,
+  textTransform: 'uppercase', marginTop: 6, marginBottom: 8,
+} as const;
+
+// Line icons with the exact stroke paths the Figma design uses.
+type FigIconName =
+  | 'monitor' | 'chevronDown' | 'wifi' | 'wifiOff' | 'bluetooth'
+  | 'qr' | 'trash' | 'check' | 'pencil' | 'x' | 'plus' | 'home' | 'user'
+  | 'gear' | 'refresh' | 'chevronRight' | 'info' | 'download';
+function FigIcon({ name, size = 18, color = FIG.text, strokeWidth }: { name: FigIconName; size?: number; color?: string; strokeWidth?: number }) {
+  const p = (d: string, sw = 1.8) => (
+    <SvgPath d={d} stroke={color} strokeWidth={strokeWidth ?? sw} strokeLinecap="round" strokeLinejoin="round" fill="none" />
+  );
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      {name === 'monitor' && (
+        <>
+          <SvgRect x={2} y={3} width={20} height={14} rx={2} stroke={color} strokeWidth={1.8} fill="none" />
+          {p('M8 21h8M12 17v4')}
+        </>
+      )}
+      {name === 'chevronDown' && p('M6 9l6 6 6-6', 2)}
+      {name === 'wifi' && p('M5 12.55a11 11 0 0114.08 0M1.42 9a16 16 0 0121.16 0M8.53 16.11a6 6 0 016.95 0M12 20h.01', 2)}
+      {name === 'wifiOff' && (
+        <>
+          {p('M1 1l22 22')}
+          {p('M16.72 11.06A10.94 10.94 0 0119 12.55M5 12.55a10.94 10.94 0 015.17-2.8M10.71 5.05A16 16 0 0122.56 9M1.42 9a15.91 15.91 0 014.7-2.88M8.53 16.11a6 6 0 016.95 0M12 20h.01')}
+        </>
+      )}
+      {name === 'bluetooth' && p('M6.5 6.5l11 11L12 23V1l5.5 5.5-11 11')}
+      {name === 'qr' && (
+        <>
+          <SvgRect x={3} y={3} width={8} height={8} rx={1} stroke={color} strokeWidth={1.8} fill="none" />
+          <SvgRect x={13} y={3} width={8} height={8} rx={1} stroke={color} strokeWidth={1.8} fill="none" />
+          <SvgRect x={3} y={13} width={8} height={8} rx={1} stroke={color} strokeWidth={1.8} fill="none" />
+          {p('M13 13h2v2h-2zM17 13h4M13 17h2v4M19 17v4M19 13v2')}
+        </>
+      )}
+      {name === 'trash' && (
+        <>
+          {p('M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6')}
+          {p('M10 11v6M14 11v6')}
+        </>
+      )}
+      {name === 'check' && p('M20 6L9 17l-5-5', 2.4)}
+      {name === 'pencil' && (
+        <>
+          {p('M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7')}
+          {p('M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z')}
+        </>
+      )}
+      {name === 'x' && p('M18 6L6 18M6 6l12 12', 2)}
+      {name === 'plus' && p('M12 5v14M5 12h14', 2.2)}
+      {name === 'home' && (
+        <>
+          {p('M3 9.5L12 3l9 6.5V20a1 1 0 01-1 1H4a1 1 0 01-1-1V9.5z')}
+          {p('M9 21V12h6v9')}
+        </>
+      )}
+      {name === 'user' && (
+        <>
+          <SvgCircle cx={12} cy={8} r={4} stroke={color} strokeWidth={1.8} fill="none" />
+          {p('M4 20c0-4 3.58-7 8-7s8 3 8 7')}
+        </>
+      )}
+      {name === 'gear' && (
+        <>
+          <SvgCircle cx={12} cy={12} r={3} stroke={color} strokeWidth={1.8} fill="none" />
+          {p('M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z')}
+        </>
+      )}
+      {name === 'refresh' && (
+        <>
+          {p('M23 4v6h-6M1 20v-6h6')}
+          {p('M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15')}
+        </>
+      )}
+      {name === 'chevronRight' && p('M9 18l6-6-6-6', 2)}
+      {name === 'info' && (
+        <>
+          <SvgCircle cx={12} cy={12} r={10} stroke={color} strokeWidth={1.8} fill="none" />
+          {p('M12 16v-4M12 8h.01', 2)}
+        </>
+      )}
+      {name === 'download' && (
+        <>
+          {p('M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4')}
+          {p('M7 10l5 5 5-5M12 15V3')}
+        </>
+      )}
+    </Svg>
+  );
+}
+
 function DeviceSwitcherModal({
   visible, onClose, onAddDevice,
 }: { visible: boolean; onClose: () => void; onAddDevice: () => void }) {
-  const { devices, activeMac, selectDevice, renameDevice, removeDevice } = usePool();
+  const { devices, activeMac, selectDevice, renameDevice } = usePool();
   const [renamingMac, setRenamingMac] = useState<string | null>(null);
   const [draftName, setDraftName] = useState('');
 
@@ -2848,80 +3473,115 @@ function DeviceSwitcherModal({
   };
 
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
-      <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={onClose}>
-        <View style={styles.pickerSheet}>
-          <Text style={styles.modalTitle}>My Devices</Text>
+    <SlideUpModal visible={visible} onClose={onClose}>
+        {/* Bottom sheet (figma "My Devices") */}
+          <View
+            style={{ backgroundColor: FIG.white, borderTopLeftRadius: 20, borderTopRightRadius: 20, paddingTop: 12, paddingHorizontal: 20, paddingBottom: 44 }}
+          >
+            <View style={{ width: 40, height: 4, backgroundColor: FIG.border, borderRadius: 2, alignSelf: 'center', marginBottom: 22 }} />
+            <Text style={{ fontSize: 20, fontWeight: '800', color: FIG.text, marginBottom: 16 }}>My Devices</Text>
 
-          <ScrollView style={{ maxHeight: 340 }}>
-            {devices.length === 0 && (
-              <Text style={{ color: COLORS.muted, paddingVertical: 16, textAlign: 'center' }}>
-                No devices yet. Scan a QR code to add one.
-              </Text>
-            )}
+            <ScrollView style={{ maxHeight: 360 }}>
+              {devices.length === 0 && (
+                <Text style={{ color: FIG.muted, paddingVertical: 16, textAlign: 'center' }}>
+                  No devices yet. Scan a QR code to add one.
+                </Text>
+              )}
 
-            {devices.map((d) => (
-              <View key={d.mac} style={styles.deviceRow}>
-                {renamingMac === d.mac ? (
-                  <View style={{ flex: 1 }}>
-                    <TextInput
-                      style={styles.fc}
-                      value={draftName}
-                      onChangeText={setDraftName}
-                      autoFocus
-                      onSubmitEditing={commitRename}
-                      placeholder="Device name"
-                    />
-                    <TouchableOpacity style={[styles.btnSec, { marginTop: 8 }]} onPress={commitRename}>
-                      <Text style={styles.btnSecTxt}>Save name</Text>
-                    </TouchableOpacity>
-                  </View>
-                ) : (
-                  <>
+              {devices.map((d) => {
+                const active = d.mac === activeMac;
+                return (
+                  <View
+                    key={d.mac}
+                    style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, backgroundColor: FIG.bg, borderRadius: 14, borderWidth: 1, borderColor: FIG.border, marginBottom: 10 }}
+                  >
                     <TouchableOpacity
-                      style={{ flex: 1 }}
                       onPress={() => { selectDevice(d.mac); onClose(); }}
+                      style={{ width: 46, height: 46, borderRadius: 12, backgroundColor: active ? 'rgba(34,197,94,0.09)' : FIG.white, borderWidth: 1, borderColor: active ? 'rgba(34,197,94,0.22)' : FIG.border, alignItems: 'center', justifyContent: 'center' }}
                     >
-                      <Text style={{
-                        color: d.mac === activeMac ? COLORS.on : COLORS.text,
-                        fontWeight: d.mac === activeMac ? '700' : '500',
-                      }}>
-                        {d.name}{d.mac === activeMac ? '  ·  active' : ''}
-                      </Text>
-                      <Text style={{ fontSize: 12, color: COLORS.label }}>
+                      <FigIcon name="monitor" size={22} color={active ? FIG.green : FIG.gray} />
+                    </TouchableOpacity>
+                    <TouchableOpacity style={{ flex: 1, minWidth: 0 }} onPress={() => { selectDevice(d.mac); onClose(); }}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginBottom: 3 }}>
+                        <Text style={{ fontSize: 15, fontWeight: '700', color: active ? FIG.green : FIG.text }} numberOfLines={1}>
+                          {d.name}
+                        </Text>
+                        {active && <Text style={{ fontSize: 12, color: FIG.green, fontWeight: '500' }}>· active</Text>}
+                      </View>
+                      <Text style={{ fontSize: 12, color: FIG.muted }} numberOfLines={1}>
                         {d.mac}{d.ssid ? ` · ${d.ssid}` : ' · Bluetooth only'}
                       </Text>
                     </TouchableOpacity>
-                    <TouchableOpacity style={styles.pBtn} onPress={() => startRename(d)}>
-                      <Text>✎</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={styles.pBtn} onPress={() => removeDevice(d.mac)}>
-                      <Text style={{ color: COLORS.danger }}>×</Text>
-                    </TouchableOpacity>
-                  </>
-                )}
-              </View>
-            ))}
-          </ScrollView>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                      {active && (
+                        <View style={{ width: 28, height: 28, borderRadius: 14, borderWidth: 1.5, borderColor: FIG.green, alignItems: 'center', justifyContent: 'center' }}>
+                          <FigIcon name="check" size={13} color={FIG.green} />
+                        </View>
+                      )}
+                      <TouchableOpacity onPress={() => startRename(d)} style={{ padding: 4 }}>
+                        <FigIcon name="pencil" size={21} color={FIG.gray} strokeWidth={2.3} />
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                );
+              })}
+            </ScrollView>
 
-          <TouchableOpacity style={[styles.btnPrimary, { marginTop: 12 }]} onPress={() => { onClose(); onAddDevice(); }}>
-            <Text style={styles.btnPrimaryTxt}>＋  Add a new device</Text>
-          </TouchableOpacity>
-        </View>
-      </TouchableOpacity>
-    </Modal>
+            <TouchableOpacity
+              onPress={() => { onClose(); onAddDevice(); }}
+              style={{ marginTop: 10, paddingVertical: 15, borderRadius: 14, backgroundColor: '#111827', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }}
+            >
+              <FigIcon name="plus" size={16} color={FIG.white} />
+              <Text style={{ color: FIG.white, fontSize: 15, fontWeight: '700' }}>Add a new device</Text>
+            </TouchableOpacity>
+          </View>
+
+        {/* Rename dialog (figma "Rename Device") — overlay inside the same
+            modal: nesting a second <Modal> misbehaves on iOS. */}
+        {renamingMac !== null && (
+          <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 }}>
+            <View style={{ backgroundColor: FIG.white, borderRadius: 20, paddingTop: 28, paddingHorizontal: 24, paddingBottom: 24, width: '100%', maxWidth: 380 }}>
+              <Text style={{ fontSize: 20, fontWeight: '800', color: FIG.text, marginBottom: 6 }}>Rename Device</Text>
+              <Text style={{ fontSize: 14, color: FIG.muted, marginBottom: 18 }}>Enter a new name for this device.</Text>
+              <TextInput
+                value={draftName}
+                onChangeText={setDraftName}
+                autoFocus
+                onSubmitEditing={commitRename}
+                style={{ paddingVertical: 13, paddingHorizontal: 16, borderRadius: 12, borderWidth: 1.5, borderColor: FIG.border, fontSize: 15, color: FIG.text, backgroundColor: FIG.white, marginBottom: 20 }}
+              />
+              <View style={{ flexDirection: 'row', gap: 10 }}>
+                <TouchableOpacity
+                  onPress={() => setRenamingMac(null)}
+                  style={{ flex: 1, paddingVertical: 13, borderRadius: 12, backgroundColor: FIG.bg, alignItems: 'center' }}
+                >
+                  <Text style={{ color: FIG.gray, fontSize: 15, fontWeight: '600' }}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={commitRename}
+                  style={{ flex: 1, paddingVertical: 13, borderRadius: 12, backgroundColor: '#111827', alignItems: 'center' }}
+                >
+                  <Text style={{ color: FIG.white, fontSize: 15, fontWeight: '700' }}>Save</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        )}
+    </SlideUpModal>
   );
 }
 
 function DeviceScreen({ onPairingComplete }: { onPairingComplete?: () => void }) {
   const {
-    status, lastError, transport, wifi,
-    activeDevice, devices, connectWithQrData, disconnect, forceReset, forgetWifi, refreshState,
+    status, lastError, transport, bleUp, wifi,
+    activeDevice, activeMac, devices, connectWithQrData, disconnect,
+    selectDevice, removeDevice,
   } = usePool();
 
   const [qrOpen, setQrOpen] = useState(false);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [wifiOpen, setWifiOpen] = useState(false);
+  const [removeOpen, setRemoveOpen] = useState(false);
 
   // ---- pairing sequence ----
   // Scanning a QR starts a guided chain: BLE connect + auth, then a Wi-Fi
@@ -3060,280 +3720,473 @@ useEffect(() => {
   const connected = status === 'connected';
   const busy = status === 'connecting' || status === 'authenticating';
 
-  const statusTone = connected ? COLORS.on : busy ? COLORS.r1 : COLORS.danger;
   const statusText =
-    connected ? 'Connected'
-      : status === 'authenticating' ? 'Verifying device'
-      : status === 'connecting' ? 'Connecting'
+    connected ? (transport === 'ble' ? 'Bluetooth Connected' : 'Wi-Fi Connected')
+      : status === 'authenticating' ? 'Verifying device…'
+      : status === 'connecting' ? 'Connecting…'
       : status === 'error' ? 'Connection problem'
-      : 'Not connected';
+      : 'Not Connected';
+
+  const wifiUp = wifi?.state === 'online';
+  const signalLabel = !connected
+    ? 'None'
+    : wifiUp && wifi?.rssi !== undefined
+      ? (wifi.rssi > -60 ? 'Strong' : wifi.rssi > -75 ? 'Good' : 'Weak')
+      : 'Strong';
+  const signalColor =
+    signalLabel === 'None' ? FIG.muted
+      : signalLabel === 'Weak' ? FIG.red
+      : signalLabel === 'Good' ? '#f59e0b'
+      : FIG.green;
+
+  const deviceName = activeDevice?.name || 'No Device';
+  const deviceIp = wifi?.ip || activeDevice?.lastIp;
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 32 }}>
-      {/* ---- Device switcher (top-left) ---- */}
-      <View style={styles.deviceBar}>
-        <TouchableOpacity style={styles.deviceBarBtn} onPress={() => setSwitcherOpen(true)}>
-          <Text style={styles.deviceBarName} numberOfLines={1}>
-            {activeDevice?.name || 'No device'}
-          </Text>
-          <Text style={styles.deviceBarChevron}>▾</Text>
+    <ScrollView style={[styles.screen, { backgroundColor: FIG.white }]} contentContainerStyle={{ paddingBottom: 40 }}>
+      {/* ---- Top bar: device selector pill + radio squares (figma) ---- */}
+      <View style={{ paddingHorizontal: 16, paddingTop: 16, paddingBottom: 14, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+        <TouchableOpacity
+          onPress={() => setSwitcherOpen(true)}
+          style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 11, paddingHorizontal: 16, backgroundColor: FIG.white, borderWidth: 1, borderColor: FIG.border, borderRadius: 14, shadowColor: '#000', shadowOpacity: 0.06, shadowRadius: 4, shadowOffset: { width: 0, height: 1 }, elevation: 2 }}
+        >
+          <FigIcon name="monitor" size={18} color={FIG.gray} />
+          <Text style={{ fontSize: 15, fontWeight: '700', color: FIG.text, maxWidth: 150 }} numberOfLines={1}>{deviceName}</Text>
+          <FigIcon name="chevronDown" size={14} color={FIG.muted} />
         </TouchableOpacity>
-        <TouchableOpacity style={styles.addBtn} onPress={() => setQrOpen(true)}>
-          <Text style={styles.addBtnTxt}>＋ Add</Text>
-        </TouchableOpacity>
-      </View>
-      {devices.length > 1 && (
-        <Text style={styles.deviceBarSub}>
-          {devices.length} devices paired · tap the name to switch
-        </Text>
-      )}
-
-      {/* ---- Hero status ---- */}
-      <Card style={{ paddingVertical: 22 }}>
-        <View style={styles.heroTop}>
-          <View style={[styles.heroDot, { backgroundColor: statusTone }]} />
-          <Text style={[styles.heroStatus, { color: statusTone }]}>{statusText}</Text>
-          {busy && <ActivityIndicator size="small" color={COLORS.r1} style={{ marginLeft: 8 }} />}
-        </View>
-
-        {/* Transport chips make the active path obvious at a glance, which
-            matters because the app silently moves between them. */}
-        <View style={styles.chipRow}>
-          <View style={[styles.tChip, transport === 'wifi' && styles.tChipOn]}>
-            <Text style={[styles.tChipTxt, transport === 'wifi' && styles.tChipTxtOn]}>
-              📶  Wi-Fi{transport === 'wifi' ? ' · active' : wifi?.state === 'online' ? ' · ready' : ''}
-            </Text>
+        <View style={{ flexDirection: 'row', gap: 10 }}>
+          <View style={{ width: 52, height: 52, borderRadius: 14, backgroundColor: bleUp ? 'rgba(34,197,94,0.09)' : FIG.bg, alignItems: 'center', justifyContent: 'center' }}>
+            <FigIcon name="bluetooth" size={21} color={bleUp ? FIG.green : FIG.muted} />
           </View>
-          <View style={[styles.tChip, transport === 'ble' && styles.tChipOn]}>
-            <Text style={[styles.tChipTxt, transport === 'ble' && styles.tChipTxtOn]}>
-              ᛒ  Bluetooth{transport === 'ble' ? ' · active' : ''}
-            </Text>
-          </View>
-        </View>
-
-        {connected && (
-          <View style={styles.heroMeta}>
-            {wifi?.state === 'online' && <Text style={styles.heroMetaTxt}>{wifi.ssid} · {wifi.ip}</Text>}
-            {activeDevice && <Text style={styles.heroMetaTxt}>{activeDevice.mac}</Text>}
-          </View>
-        )}
-
-        {wifi?.state === 'offline' && (
-          <View style={styles.noticeWarn}>
-            <Text style={styles.noticeTxt}>
-              Wi-Fi is down. Stay within Bluetooth range to keep control — the app
-              switches back to Wi-Fi on its own once the network returns.
-            </Text>
-          </View>
-        )}
-        {fwMissingWifi && (
-          <View style={styles.noticeWarn}>
-            <Text style={styles.noticeTxt}>
-              ⚠️ This controller&apos;s firmware doesn&apos;t support Wi-Fi. Flash the
-              latest firmware (relay_timer_connection.ino) to enable Wi-Fi setup —
-              until then it works over Bluetooth only.
-            </Text>
-          </View>
-        )}
-        {lastError && (
-          <View style={styles.noticeErr}>
-            <Text style={[styles.noticeTxt, { color: COLORS.danger }]}>{lastError}</Text>
-          </View>
-        )}
-
-        {connected && (
-          <TouchableOpacity style={[styles.btnSec, { marginTop: 14 }]} onPress={refreshState}>
-            <Text style={styles.btnSecTxt}>⟳  Refresh</Text>
+          <TouchableOpacity
+            // Wi-Fi management needs a connected device to talk to. Without
+            // one the square is a dead indicator, like the Bluetooth one.
+            // Tapping opens the network list (scan + join any network, and
+            // forget the connected one from inside the sheet).
+            disabled={!connected}
+            onPress={openWifiSetup}
+            style={{ width: 52, height: 52, borderRadius: 14, backgroundColor: wifiUp ? 'rgba(34,197,94,0.09)' : FIG.bg, alignItems: 'center', justifyContent: 'center', opacity: connected ? 1 : 0.5 }}
+          >
+            <FigIcon name="wifi" size={21} color={wifiUp ? FIG.green : FIG.muted} />
           </TouchableOpacity>
-        )}
-      </Card>
+        </View>
+      </View>
 
-      {/* ---- Wi-Fi ---- */}
-      {connected && (
-        <Card>
-          <Text style={styles.secTitle}>WI-FI</Text>
-          {wifi?.state === 'unconfigured' ? (
-            <>
-              <Text style={styles.fhint}>
-                This device isn&apos;t on Wi-Fi yet. It works over Bluetooth, but Wi-Fi
-                gives you whole-house range and keeps its clock accurate.
-              </Text>
-              <TouchableOpacity style={[styles.btnPrimary, { marginTop: 12 }]} onPress={openWifiSetup}>
-                <Text style={styles.btnPrimaryTxt}>📶  Set up Wi-Fi</Text>
-              </TouchableOpacity>
-            </>
-          ) : wifi?.state === 'connecting' ? (
-            <View style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 10 }}>
-              <ActivityIndicator color={COLORS.r1} />
-              <Text style={{ color: COLORS.muted, marginLeft: 12, flex: 1 }}>
-                Joining {wifi.ssid}…
+      <View style={{ paddingHorizontal: 14 }}>
+        {/* ---- Status card ---- */}
+        <View style={figCard}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 18 }}>
+            <View style={{ width: 11, height: 11, borderRadius: 6, backgroundColor: connected ? FIG.green : '#d1d5db' }} />
+            <Text style={{ fontSize: 19, fontWeight: '800', color: connected ? FIG.green : FIG.muted }}>{statusText}</Text>
+            {busy && <ActivityIndicator size="small" color={FIG.blue} style={{ marginLeft: 4 }} />}
+          </View>
+
+          <View style={{ flexDirection: 'row', gap: 9, marginBottom: 18 }}>
+            <View style={figTile}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginBottom: 4 }}>
+                <FigIcon name="wifi" size={14} color={wifiUp ? FIG.text : FIG.muted} />
+                <Text style={{ fontSize: 13, fontWeight: '700', color: wifiUp ? FIG.text : FIG.muted }}>Wi-Fi</Text>
+              </View>
+              <Text style={{ fontSize: 12, color: FIG.muted, fontWeight: '500' }} numberOfLines={1}>
+                {wifiUp ? wifi?.ssid || 'Connected' : 'Not connected'}
               </Text>
             </View>
-          ) : (
-            <>
-              <View style={styles.wifiSummary}>
-                <Text style={styles.wifiSummarySsid}>{wifi?.ssid || '—'}</Text>
-                <View style={[styles.statePill, wifi?.state === 'online' ? styles.statePillOn : styles.statePillOff]}>
-                  <Text style={[styles.statePillTxt, { color: wifi?.state === 'online' ? '#047857' : COLORS.danger }]}>
-                    {wifi?.state === 'online' ? 'ONLINE' : 'OFFLINE'}
-                  </Text>
-                </View>
+            <View style={figTile}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginBottom: 4 }}>
+                <FigIcon name="bluetooth" size={14} color={bleUp ? FIG.text : FIG.muted} />
+                <Text style={{ fontSize: 13, fontWeight: '700', color: bleUp ? FIG.text : FIG.muted }}>Bluetooth</Text>
               </View>
-              {wifi?.state === 'online' && wifi.rssi !== undefined && (
-                <Text style={styles.fhint}>Signal {signalBars(wifi.rssi)}  ({wifi.rssi} dBm) · {wifi.ip}</Text>
-              )}
-              <TouchableOpacity style={[styles.btnSec, { marginTop: 12 }]} onPress={openWifiSetup}>
-                <Text style={styles.btnSecTxt}>Change network</Text>
+              <Text style={{ fontSize: 12, color: FIG.muted, fontWeight: '500' }} numberOfLines={1}>
+                {bleUp ? deviceName : 'Not connected'}
+              </Text>
+            </View>
+            <View style={[figTile, { flex: 0, minWidth: 64, alignItems: 'center', justifyContent: 'center', gap: 4 }]}>
+              <FigIcon name="wifi" size={16} color={signalColor} />
+              <Text style={{ fontSize: 12, fontWeight: '700', color: signalColor }}>{signalLabel}</Text>
+            </View>
+          </View>
+
+          <Text style={{ fontSize: 16, fontWeight: '600', color: FIG.text }}>
+            {connected ? `${deviceName}${deviceIp ? ` · ${deviceIp}` : ''}` : '—'}
+          </Text>
+          {connected && activeDevice && (
+            <Text style={{ fontSize: 13, color: FIG.green, fontWeight: '500', marginTop: 4 }}>{activeDevice.mac}</Text>
+          )}
+
+          {wifi?.state === 'offline' && (
+            <View style={styles.noticeWarn}>
+              <Text style={styles.noticeTxt}>
+                Wi-Fi is down. Stay within Bluetooth range to keep control — the app
+                switches back to Wi-Fi on its own once the network returns.
+              </Text>
+            </View>
+          )}
+          {fwMissingWifi && (
+            <View style={styles.noticeWarn}>
+              <Text style={styles.noticeTxt}>
+                ⚠️ This controller&apos;s firmware doesn&apos;t support Wi-Fi. Flash the
+                latest firmware to enable Wi-Fi setup — until then it works over
+                Bluetooth only.
+              </Text>
+            </View>
+          )}
+          {lastError && (
+            <View style={styles.noticeErr}>
+              <Text style={[styles.noticeTxt, { color: COLORS.danger }]}>{lastError}</Text>
+            </View>
+          )}
+        </View>
+
+        {/* ---- Add Another Device (figma) ---- */}
+        <Text style={figSection}>{devices.length > 0 ? 'Add Another Device' : 'Pair a Device'}</Text>
+        <View style={figCard}>
+          <TouchableOpacity
+            onPress={() => setQrOpen(true)}
+            style={{ paddingVertical: 16, borderRadius: 13, backgroundColor: '#111827', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, marginBottom: activeDevice ? 10 : 0 }}
+          >
+            <FigIcon name="qr" size={22} color={FIG.white} />
+            <Text style={{ color: FIG.white, fontSize: 15, fontWeight: '700' }}>Scan QR</Text>
+          </TouchableOpacity>
+          {/* Nothing to remove or reconnect without a paired device — these
+              two only exist once a device is known. */}
+          {activeDevice && (
+            <>
+              <TouchableOpacity
+                onPress={() => setRemoveOpen(true)}
+                style={{ paddingVertical: 16, borderRadius: 13, borderWidth: 1, borderColor: FIG.border, backgroundColor: FIG.white, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, marginBottom: 10 }}
+              >
+                <FigIcon name="trash" size={18} color={FIG.text} />
+                <Text style={{ color: FIG.text, fontSize: 15, fontWeight: '600' }}>Remove this device</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.btnSec, { marginTop: 8 }]} onPress={forgetWifi}>
-                <Text style={[styles.btnSecTxt, { color: COLORS.danger }]}>Forget this network</Text>
+              <TouchableOpacity
+                onPress={() => (connected || busy ? disconnect() : selectDevice(activeDevice.mac))}
+                style={{ paddingVertical: 16, borderRadius: 13, borderWidth: 1, borderColor: connected || busy ? '#fecaca' : '#bbf7d0', backgroundColor: connected || busy ? '#fff5f5' : '#f0fdf4', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 }}
+              >
+                {connected || busy
+                  ? <FigIcon name="wifiOff" size={18} color={FIG.red} />
+                  : <FigIcon name="wifi" size={18} color={FIG.green} />}
+                <Text style={{ color: connected || busy ? FIG.red : FIG.green, fontSize: 15, fontWeight: '700' }}>
+                  {connected || busy ? 'Disconnect' : 'Reconnect'}
+                </Text>
               </TouchableOpacity>
             </>
           )}
-        </Card>
-      )}
+        </View>
+      </View>
 
-      <Card>
-        <Text style={styles.secTitle}>{devices.length > 0 ? 'ADD ANOTHER DEVICE' : 'PAIR A DEVICE'}</Text>
-        {status === 'connected' ? (
-          <>
-            <TouchableOpacity style={styles.btnPrimary} onPress={() => setQrOpen(true)}>
-              <Text style={styles.btnPrimaryTxt}>📷  Scan QR to Add Device</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={[styles.btnSec, { marginTop: 12, backgroundColor: 'rgba(220,38,38,0.08)' }]} onPress={disconnect}>
-              <Text style={[styles.btnSecTxt, { color: COLORS.danger }]}>Disconnect</Text>
-            </TouchableOpacity>
-          </>
-        ) : (
-          <>
-            <TouchableOpacity style={styles.btnPrimary} onPress={() => setQrOpen(true)}>
-              <Text style={styles.btnPrimaryTxt}>📷  Scan QR to Connect</Text>
-            </TouchableOpacity>
-            <Text style={styles.fhint}>
-              Scan the QR code printed on your ESP32-S3 controller. Pairing is
-              secured — the controller only accepts commands from this app.
+      {/* ---- Remove Device confirmation (figma) ---- */}
+      <SlideUpModal
+        visible={removeOpen}
+        onClose={() => setRemoveOpen(false)}
+        overlayStyle={{ justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 }}
+        distance={80}
+      >
+          <View
+            style={{ backgroundColor: FIG.white, borderRadius: 20, paddingTop: 28, paddingHorizontal: 24, paddingBottom: 24, width: '100%', maxWidth: 380 }}
+          >
+            <Text style={{ fontSize: 20, fontWeight: '800', color: FIG.text, marginBottom: 8 }}>Remove Device</Text>
+            <Text style={{ fontSize: 14, color: FIG.muted, marginBottom: 24, lineHeight: 21 }}>
+              Are you sure you want to remove <Text style={{ color: FIG.text, fontWeight: '700' }}>{deviceName}</Text>?
+              This will disconnect and unpair the device.
             </Text>
-          </>
-        )}
-      </Card>
-
-      {status !== 'connected' && (
-        <Card>
-          <Text style={styles.secTitle}>TROUBLESHOOTING</Text>
-          <Text style={styles.fhint}>
-            If connecting fails with &quot;operation was cancelled&quot;, the phone&apos;s OS may
-            still think it&apos;s connected from a previous session. Reset it here, then try again.
-          </Text>
-          <TouchableOpacity style={[styles.btnSec, { marginTop: 8 }]} onPress={forceReset}>
-            <Text style={styles.btnSecTxt}>Reset Bluetooth Connection</Text>
-          </TouchableOpacity>
-        </Card>
-      )}
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <TouchableOpacity
+                onPress={() => setRemoveOpen(false)}
+                style={{ flex: 1, paddingVertical: 13, borderRadius: 12, backgroundColor: FIG.bg, alignItems: 'center' }}
+              >
+                <Text style={{ color: FIG.gray, fontSize: 15, fontWeight: '600' }}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => { setRemoveOpen(false); if (activeMac) removeDevice(activeMac); }}
+                style={{ flex: 1, paddingVertical: 13, borderRadius: 12, backgroundColor: FIG.red, alignItems: 'center' }}
+              >
+                <Text style={{ color: FIG.white, fontSize: 15, fontWeight: '700' }}>Remove</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+      </SlideUpModal>
 
       <QrScannerModal visible={qrOpen} onClose={() => setQrOpen(false)} onScanned={onQrScanned} />
       <WifiSetupModal visible={wifiOpen} onClose={closeWifiModal} notice={pairingNotice} />
       <DeviceSwitcherModal
         visible={switcherOpen}
         onClose={() => setSwitcherOpen(false)}
-        onAddDevice={() => setQrOpen(true)}
+        // Wait for the sheet's closing animation to finish and its Modal to
+        // unmount — a modal presented while another is still up is silently
+        // dropped by the OS, which left the scanner never appearing.
+        onAddDevice={() => setTimeout(() => setQrOpen(true), 300)}
       />
     </ScrollView>
   );
 }
 
 // ============================================================
-//  ACCOUNT TAB — local login/signup mock (no backend)
+//  SETTINGS TAB — firmware version + OTA update
 // ============================================================
-function AccountScreen() {
-  const [user, setUser] = useState<{ name: string; email: string } | null>(null);
-  const [mode, setMode] = useState<'login' | 'signup'>('login');
-  const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+type OtaState =
+  | { kind: 'checking' }
+  | { kind: 'uptodate'; v: string }
+  | { kind: 'available'; v: string; url: string; notes?: string }
+  | { kind: 'blocked'; msg: string }
+  | { kind: 'busy'; label: string; pct: number }
+  | { kind: 'done'; v: string }
+  | { kind: 'error'; msg: string };
 
-  const submit = () => {
-    if (!email || !password) return;
-    setUser({ name: mode === 'signup' ? name || email.split('@')[0] : email.split('@')[0], email });
+function FirmwareUpdateModal({ visible, onClose }: { visible: boolean; onClose: () => void }) {
+  const { deviceFw, pumps, otaPerform, status, activeMac } = usePool();
+  const [ota, setOta] = useState<OtaState>({ kind: 'checking' });
+  const busy = ota.kind === 'busy';
+
+  useEffect(() => {
+    if (!visible) return;
+    fwUpdateUiOpen.current = true;
+    return () => { fwUpdateUiOpen.current = false; };
+  }, [visible]);
+
+  useEffect(() => {
+    if (!visible) return;
+    let cancelled = false;
+    (async () => {
+      setOta({ kind: 'checking' });
+      if (status !== 'connected' || !deviceFw) {
+        setOta({
+          kind: 'error',
+          msg: !deviceFw && status === 'connected'
+            ? "The device didn't report a firmware version — it runs a build from before OTA support. Flash it over USB once."
+            : 'Connect to the device first — the app compares the update against the version the device itself reports.',
+        });
+        return;
+      }
+      try {
+        const res = await fetch(FW_MANIFEST_URL);
+        if (!res.ok) throw new Error(`manifest fetch failed (${res.status})`);
+        const m = await res.json();
+        if (typeof m?.version !== 'string' || typeof m?.url !== 'string') throw new Error('malformed version.json');
+        if (cancelled) return;
+        if (versionNewer(m.version, deviceFw)) setOta({ kind: 'available', v: m.version, url: m.url, notes: m.notes });
+        else setOta({ kind: 'uptodate', v: deviceFw });
+      } catch (err: any) {
+        if (!cancelled) setOta({ kind: 'error', msg: `Could not check for updates: ${err?.message || err}` });
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
+
+  const startUpdate = async () => {
+    if (ota.kind !== 'available') return;
+    // Updating stalls the controller for ~20s — never while a pump runs.
+    const manual = pumps.filter((pp) => pp.mode === 'on' || (pp.active && pp.mode !== 'auto'));
+    if (manual.length) {
+      setOta({ kind: 'blocked', msg: `${manual.map((pp) => pp.name).join(', ')} is running. Turn the pump off, then try again.` });
+      return;
+    }
+    const scheduled = pumps.filter((pp) => pp.active && pp.mode === 'auto');
+    if (scheduled.length) {
+      setOta({ kind: 'blocked', msg: `${scheduled.map((pp) => pp.name).join(', ')} is running from a schedule. Disable that schedule first, then try again.` });
+      return;
+    }
+    const target = ota;
+    try {
+      await otaPerform(target.url, target.v, (label, pct) => setOta({ kind: 'busy', label, pct }));
+      fwJustUpdatedTo.current = { mac: activeMac || '', version: target.v };
+      setOta({ kind: 'done', v: target.v });
+    } catch (err: any) {
+      setOta({ kind: 'error', msg: err?.message || String(err) });
+    }
   };
 
-  if (user) {
-    const initials = user.name.slice(0, 2).toUpperCase();
-    return (
-      <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 32 }}>
-        <Card style={{ alignItems: 'center', paddingVertical: 32 }}>
-          <View style={styles.avatar}>
-            <Text style={styles.avatarTxt}>{initials}</Text>
-          </View>
-          <Text style={{ fontSize: 20, fontWeight: '700', marginTop: 12 }}>{user.name}</Text>
-          <Text style={{ color: COLORS.muted, marginTop: 2 }}>{user.email}</Text>
-        </Card>
-
-        <Card>
-          <Text style={styles.secTitle}>ACCOUNT</Text>
-          <TouchableOpacity style={styles.accountRow}>
-            <Text>Edit Profile</Text>
-            <Text style={{ color: COLORS.label }}>›</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.accountRow}>
-            <Text>Change Password</Text>
-            <Text style={{ color: COLORS.label }}>›</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.accountRow}>
-            <Text>Notification Preferences</Text>
-            <Text style={{ color: COLORS.label }}>›</Text>
-          </TouchableOpacity>
-        </Card>
-
-        <TouchableOpacity style={[styles.btnSec, { marginHorizontal: 16 }]} onPress={() => setUser(null)}>
-          <Text style={[styles.btnSecTxt, { color: '#dc2626' }]}>Log Out</Text>
-        </TouchableOpacity>
-      </ScrollView>
-    );
-  }
-
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 32, flexGrow: 1 }}>
-      <Card style={{ marginTop: 24 }}>
-        <Text style={[styles.secTitle, { marginBottom: 18 }]}>{mode === 'login' ? 'LOG IN' : 'CREATE ACCOUNT'}</Text>
-
-        <View style={styles.seg}>
-          <TouchableOpacity style={[styles.segBtn, mode === 'login' && styles.segBtnActive]} onPress={() => setMode('login')}>
-            <Text style={[styles.segTxt, mode === 'login' && styles.segTxtActive]}>Log In</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.segBtn, mode === 'signup' && styles.segBtnActive]} onPress={() => setMode('signup')}>
-            <Text style={[styles.segTxt, mode === 'signup' && styles.segTxtActive]}>Sign Up</Text>
-          </TouchableOpacity>
+    <SlideUpModal
+      visible={visible}
+      onClose={busy ? () => {} : onClose}
+      closeOnBackdrop={!busy}
+      overlayStyle={{ justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 }}
+      distance={80}
+    >
+      <View style={{ backgroundColor: FIG.white, borderRadius: 20, paddingTop: 28, paddingHorizontal: 24, paddingBottom: 24, width: '100%', maxWidth: 380 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+          <FigIcon name="download" size={22} color={FIG.text} />
+          <Text style={{ fontSize: 20, fontWeight: '800', color: FIG.text }}>Firmware Update</Text>
         </View>
 
-        {mode === 'signup' && (
+        {ota.kind === 'checking' && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 14 }}>
+            <ActivityIndicator color={FIG.green} />
+            <Text style={{ fontSize: 14, color: FIG.muted }}>Checking for updates…</Text>
+          </View>
+        )}
+
+        {ota.kind === 'uptodate' && (
+          <Text style={{ fontSize: 14, color: FIG.muted, lineHeight: 21, marginBottom: 18 }}>
+            Your controller is up to date (<Text style={{ color: FIG.text, fontWeight: '700' }}>v{ota.v}</Text>).
+          </Text>
+        )}
+
+        {ota.kind === 'available' && (
           <>
-            <Text style={styles.fieldLabel}>Name</Text>
-            <TextInput style={styles.fc} placeholder="Jane Doe" value={name} onChangeText={setName} />
+            <Text style={{ fontSize: 14, color: FIG.muted, lineHeight: 21, marginBottom: 8 }}>
+              Version <Text style={{ color: FIG.text, fontWeight: '700' }}>v{ota.v}</Text> is available
+              (installed: v{deviceFw}).
+            </Text>
+            {!!ota.notes && (
+              <Text style={{ fontSize: 13, color: FIG.gray, lineHeight: 19, marginBottom: 8 }}>{ota.notes}</Text>
+            )}
+            <Text style={{ fontSize: 12, color: FIG.muted, lineHeight: 18, marginBottom: 18 }}>
+              Your phone must be on the same Wi-Fi network as the controller. The device restarts
+              when the update finishes; all settings and schedules are kept.
+            </Text>
           </>
         )}
-        <Text style={styles.fieldLabel}>Email</Text>
-        <TextInput style={styles.fc} placeholder="you@example.com" autoCapitalize="none" keyboardType="email-address" value={email} onChangeText={setEmail} />
-        <Text style={styles.fieldLabel}>Password</Text>
-        <TextInput style={styles.fc} placeholder="••••••••" secureTextEntry value={password} onChangeText={setPassword} />
 
-        <TouchableOpacity style={[styles.btnPrimary, { marginTop: 18 }]} onPress={submit}>
-          <Text style={styles.btnPrimaryTxt}>{mode === 'login' ? 'Log In' : 'Sign Up'}</Text>
+        {(ota.kind === 'blocked' || ota.kind === 'error') && (
+          <Text style={{ fontSize: 14, color: ota.kind === 'blocked' ? '#b45309' : FIG.red, lineHeight: 21, marginBottom: 18 }}>
+            {ota.msg}
+          </Text>
+        )}
+
+        {ota.kind === 'busy' && (
+          <View style={{ paddingVertical: 6, marginBottom: 16 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+              <ActivityIndicator color={FIG.green} />
+              <Text style={{ fontSize: 14, color: FIG.text, fontWeight: '600', flex: 1 }}>{ota.label}</Text>
+            </View>
+            <View style={{ height: 6, borderRadius: 3, backgroundColor: FIG.bg, overflow: 'hidden' }}>
+              <View style={{ height: 6, borderRadius: 3, backgroundColor: FIG.green, width: `${Math.round(ota.pct * 100)}%` }} />
+            </View>
+            <Text style={{ fontSize: 12, color: FIG.muted, marginTop: 10 }}>
+              Keep the app open — do not power the controller off.
+            </Text>
+          </View>
+        )}
+
+        {ota.kind === 'done' && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 18 }}>
+            <FigIcon name="check" size={18} color={FIG.green} />
+            <Text style={{ fontSize: 14, color: FIG.green, fontWeight: '600', flex: 1 }}>
+              Updated to v{ota.v}. The controller is back online.
+            </Text>
+          </View>
+        )}
+
+        <View style={{ flexDirection: 'row', gap: 10 }}>
+          {ota.kind === 'available' ? (
+            <>
+              <TouchableOpacity onPress={onClose} style={{ flex: 1, paddingVertical: 13, borderRadius: 12, backgroundColor: FIG.bg, alignItems: 'center' }}>
+                <Text style={{ color: FIG.gray, fontSize: 15, fontWeight: '600' }}>Later</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={startUpdate} style={{ flex: 1, paddingVertical: 13, borderRadius: 12, backgroundColor: '#111827', alignItems: 'center' }}>
+                <Text style={{ color: FIG.white, fontSize: 15, fontWeight: '700' }}>Update</Text>
+              </TouchableOpacity>
+            </>
+          ) : !busy ? (
+            <TouchableOpacity onPress={onClose} style={{ flex: 1, paddingVertical: 13, borderRadius: 12, backgroundColor: FIG.bg, alignItems: 'center' }}>
+              <Text style={{ color: FIG.gray, fontSize: 15, fontWeight: '600' }}>Close</Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
+      </View>
+    </SlideUpModal>
+  );
+}
+
+function SettingsScreen() {
+  const { deviceFw, status } = usePool();
+  const [updOpen, setUpdOpen] = useState(false);
+
+  return (
+    <ScrollView style={[styles.screen, { backgroundColor: FIG.white }]} contentContainerStyle={{ paddingBottom: 40 }}>
+      <View style={{ paddingHorizontal: 2, paddingTop: 18, paddingBottom: 6 }}>
+        <Text style={{ fontSize: 24, fontWeight: '800', color: FIG.text }}>Settings</Text>
+      </View>
+
+      <Text style={figSection}>Firmware</Text>
+      <View style={figCard}>
+        {/* Tapping the version row runs the same GitHub-vs-device check
+            and pops the update dialog with the verdict. */}
+        <TouchableOpacity
+          onPress={() => { if (!fwUpdateUiOpen.current) setUpdOpen(true); }}
+          style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 13 }}
+        >
+          <FigIcon name="info" size={20} color={FIG.gray} />
+          <Text style={{ fontSize: 15, fontWeight: '500', color: FIG.text, flex: 1 }}>Firmware version</Text>
+          <Text style={{ fontSize: 15, fontWeight: '700', color: deviceFw ? FIG.green : FIG.muted }}>
+            {deviceFw ? `v${deviceFw}` : status === 'connected' ? 'unknown' : '—'}
+          </Text>
         </TouchableOpacity>
-        <Text style={styles.fhint}>This is a local mock — no account data leaves the app yet.</Text>
-      </Card>
+        <View style={{ height: 1, backgroundColor: FIG.border }} />
+        <TouchableOpacity
+          onPress={() => { if (!fwUpdateUiOpen.current) setUpdOpen(true); }}
+          style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 13 }}
+        >
+          <FigIcon name="refresh" size={20} color={FIG.gray} />
+          <Text style={{ fontSize: 15, fontWeight: '500', color: FIG.text, flex: 1 }}>Firmware update</Text>
+          <FigIcon name="chevronRight" size={18} color={FIG.muted} />
+        </TouchableOpacity>
+      </View>
+
+      <FirmwareUpdateModal visible={updOpen} onClose={() => setUpdOpen(false)} />
     </ScrollView>
   );
+}
+
+// Update watchdog: the moment the connected device reports its version
+// (app open / reconnect) the manifest is checked and the popup appears on
+// a mismatch — and it re-checks both sides every 10 minutes after that.
+function AutoUpdatePrompt() {
+  const { deviceFw, status, activeMac } = usePool();
+  const [open, setOpen] = useState(false);
+  // Refs so the 10-minute interval always sees current values without
+  // re-arming itself on every state change.
+  const openRef = useRef(open); openRef.current = open;
+  const fwRef = useRef(deviceFw); fwRef.current = deviceFw;
+  const statusRef = useRef(status); statusRef.current = status;
+  const macRef = useRef(activeMac); macRef.current = activeMac;
+
+  const check = useCallback(async () => {
+    if (openRef.current || fwUpdateUiOpen.current || modalDepth.current > 0) return; // some dialog is already up
+    const fw = fwRef.current;
+    if (statusRef.current !== 'connected' || !fw) return;
+    try {
+      const res = await fetch(FW_MANIFEST_URL);
+      if (!res.ok) return;
+      const m = await res.json();
+      if (openRef.current || fwUpdateUiOpen.current || modalDepth.current > 0) return;
+      if (typeof m?.version !== 'string') return;
+      // THIS device was just updated to this version — the state the app
+      // holds may still predate the reboot; don't re-suggest it. A
+      // DIFFERENT device on old firmware still gets the popup.
+      const just = fwJustUpdatedTo.current;
+      if (just && just.version === m.version && just.mac === (macRef.current || '')) return;
+      if (versionNewer(m.version, fw)) setOpen(true);
+    } catch { /* offline or manifest missing — stay quiet */ }
+  }, []);
+
+  // Immediate check whenever the device's reported version (re)arrives —
+  // including after SWITCHING devices: deviceFw is cleared on disconnect
+  // and re-learned from the new device's first state push.
+  useEffect(() => {
+    if (status === 'connected' && deviceFw) check();
+  }, [deviceFw, status, activeMac, check]);
+
+  // And the 10-minute recheck cadence.
+  useEffect(() => {
+    const t = setInterval(check, 10 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [check]);
+
+  return <FirmwareUpdateModal visible={open} onClose={() => setOpen(false)} />;
 }
 
 // ============================================================
 //  BOTTOM TAB BAR + ROOT APP
 // ============================================================
-type TabKey = 'home' | 'device' | 'account';
+type TabKey = 'home' | 'device' | 'settings';
 
-function TabButton({ label, icon, active, onPress }: { label: string; icon: string; active: boolean; onPress: () => void }) {
+function TabButton({ label, icon, active, onPress }: { label: string; icon: FigIconName; active: boolean; onPress: () => void }) {
   return (
     <TouchableOpacity style={styles.tabBtn} onPress={onPress}>
-      <Text style={[styles.tabIcon, active && { opacity: 1 }]}>{icon}</Text>
+      <FigIcon name={icon} size={22} color={active ? FIG.green : FIG.muted} />
       <Text style={[styles.tabLabel, active && styles.tabLabelActive]}>{label}</Text>
       {active && <View style={styles.tabIndicator} />}
     </TouchableOpacity>
@@ -3350,13 +4203,14 @@ export default function App() {
         <View style={{ flex: 1 }}>
           {tab === 'home' && <HomeScreen />}
           {tab === 'device' && <DeviceScreen onPairingComplete={() => setTab('home')} />}
-          {tab === 'account' && <AccountScreen />}
+          {tab === 'settings' && <SettingsScreen />}
+          <AutoUpdatePrompt />
         </View>
 
         <View style={styles.tabBar}>
-          <TabButton label="Home" icon="🏠" active={tab === 'home'} onPress={() => setTab('home')} />
-          <TabButton label="Device" icon="🔌" active={tab === 'device'} onPress={() => setTab('device')} />
-          <TabButton label="Account" icon="👤" active={tab === 'account'} onPress={() => setTab('account')} />
+          <TabButton label="Home" icon="home" active={tab === 'home'} onPress={() => setTab('home')} />
+          <TabButton label="Device" icon="monitor" active={tab === 'device'} onPress={() => setTab('device')} />
+          <TabButton label="Settings" icon="gear" active={tab === 'settings'} onPress={() => setTab('settings')} />
         </View>
       </SafeAreaView>
     </PoolProvider>
@@ -3462,8 +4316,8 @@ const styles = StyleSheet.create({
   tabBtn: { flex: 1, alignItems: 'center', gap: 2 },
   tabIcon: { fontSize: 20, opacity: 0.5 },
   tabLabel: { fontSize: 11, color: COLORS.muted },
-  tabLabelActive: { color: '#0f172a', fontWeight: '700' },
-  tabIndicator: { position: 'absolute', top: -8, width: 24, height: 3, borderRadius: 2, backgroundColor: COLORS.on },
+  tabLabelActive: { color: '#22c55e', fontWeight: '700' },
+  tabIndicator: { position: 'absolute', top: -8, width: 24, height: 3, borderRadius: 2, backgroundColor: '#22c55e' },
 
   scannerRoot: { flex: 1, backgroundColor: '#000' },
   scannerOverlay: { flex: 1, alignItems: 'center', justifyContent: 'center' },

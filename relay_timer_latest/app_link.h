@@ -41,6 +41,12 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <Update.h>
+
+// The sketch defines the real version before including this header.
+#ifndef FW_VERSION
+#define FW_VERSION "0.0.0"
+#endif
 #include "esp_mac.h"
 #include "esp_random.h"
 #include "mbedtls/md.h"
@@ -397,6 +403,7 @@ inline String appBuildStateJson() {
   doc["type"] = "state";
   doc["mac"] = appDeviceMac;   // stable device identity — the app keys its registry on this
   doc["name"] = appBleName;
+  doc["fwVersion"] = FW_VERSION; // the app compares this against the GitHub manifest
 
   JsonObject w = doc.createNestedObject("wifi");
   w["state"] = appWifiPhaseStr();
@@ -575,6 +582,7 @@ inline String appExecuteCommand(JsonDocument& doc, bool& changed) {
         return appBuildAck(cmd, false, "name not in the allowed list");
       if (!pumpNameIndexSet(id, idx))
         return appBuildAck(cmd, false, "name unavailable (in use, or relay-only)");
+      Serial.printf("[cmd] pump %d renamed to \"%s\"\n", id, name);
     }
     markDirty();
     Serial.printf("[cmd] pump %d config: speed=%u type=%u\n", id, speed, type);
@@ -727,6 +735,40 @@ inline void appBroadcastWifiEvent() {
     Serial.printf("[ble] wifi event -> conn %u: %s  %s\n",
                   appSessions[i].connHandle, ok ? "delivered" : "DROPPED", out.c_str());
   }
+}
+
+// Same trick for pump confirmations: the full state push is a large
+// multi-chunk BLE message that radio contention can tear, which left
+// the app's pump pill stuck at "Turning on…" over Bluetooth while
+// Wi-Fi (polled HTTP) worked. This fits in one notify, so the flip of
+// a pump's confirmed state reaches the phone reliably and immediately.
+// Returns true only when the event reached every authed BLE session (or
+// none exists to tell) — the caller keeps the change queued and retries
+// on false, because a dropped notify must not swallow a confirmation.
+inline bool appBroadcastPumpEvent(uint8_t pumpId, bool active, uint16_t speed) {
+  StaticJsonDocument<192> doc;
+  doc["type"] = "pump";
+  doc["mac"] = appDeviceMac;
+  doc["id"] = pumpId;
+  doc["active"] = active;
+  doc["speedRpm"] = speed;
+  // Name rides along so a rename reaches BLE phones even when the big
+  // state push is torn by radio contention.
+  char nameBuf[16];
+  pumpDisplayName(pumpId, nameBuf, sizeof(nameBuf));
+  doc["name"] = nameBuf;
+  String out;
+  serializeJson(doc, out);
+  if (appAuthedCount() == 0) return true; // nobody to tell — nothing to retry
+  bool allOk = true;
+  for (int i = 0; i < APP_MAX_SESSIONS; i++) {
+    if (!appSessions[i].inUse || !appSessions[i].authed) continue;
+    bool ok = appSendChunkedTo(&appSessions[i], out);
+    if (!ok) allOk = false;
+    Serial.printf("[ble] pump event -> conn %u: %s  %s\n",
+                  appSessions[i].connHandle, ok ? "delivered" : "DROPPED", out.c_str());
+  }
+  return allOk;
 }
 
 // ============================================================
@@ -951,6 +993,33 @@ struct AppHttpSession {
 };
 AppHttpSession appHttpSessions[APP_MAX_HTTP_SESSIONS];
 char appHttpNonce[33] = "";
+
+// ---- OTA ---------------------------------------------------------
+// The app downloads the release .bin from GitHub and POSTs it raw to
+// /update (bearer-authenticated). The image lands in the inactive OTA
+// slot; only a fully verified write reboots into it, so an interrupted
+// upload never bricks — the old slot keeps booting.
+uint32_t appRebootAtMs = 0;           // set after a successful update; loop restarts
+const char* appOtaRefuseMsg = nullptr; // reason the in-flight upload was refused
+
+// Updating stalls the loop while flash sectors are written — refuse
+// while any pump is running (manually or from a schedule) so an RS-485
+// pump is never left unsupervised mid-command.
+inline bool appAnyPumpRunning() {
+  for (int i = 1; i <= MAX_PUMPS; i++) {
+    bool a; uint16_t sp;
+    pumpActualStateGet(i, a, sp);
+    if (a || pumpModeGet(i) == MODE_ON) return true;
+  }
+  return false;
+}
+
+// Wi-Fi scans requested over HTTP: there is no push channel to deliver
+// the results, so the loop stores the latest scan here and the app polls
+// GET /wifiScan for it. The sentinel marks "requested via HTTP".
+#define APP_SCAN_HTTP 0xFFFF
+String appLastScanJson;
+volatile bool appScanFresh = false;
 bool appHttpNonceIssued = false;
 
 inline bool appHttpTokenValid(const char* token) {
@@ -1039,6 +1108,29 @@ inline void appHttpRegister() {
     appHttpSendJson(request, 200, appBuildStateJson());
   });
 
+  // Reachability probe for the app's "Ping over Wi-Fi" button. Deliberately
+  // unauthenticated — it proves the network path and nothing else (no state,
+  // no control). The serial line is the ground truth the user watches for.
+  // Latest Wi-Fi scan results for HTTP clients (no push channel exists to
+  // deliver them). {"pending":true} until the loop finishes the scan.
+  appServer.on("/wifiScan", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!appHttpAuthorized(request)) { appHttpSendJson(request, 401, appBuildAck("wifiScan", false, "unauthorized")); return; }
+    if (appScanFresh && appLastScanJson.length()) { appHttpSendJson(request, 200, appLastScanJson); return; }
+    appHttpSendJson(request, 200, String("{\"type\":\"wifiScan\",\"pending\":true}"));
+  });
+
+  appServer.on("/ping", HTTP_GET, [](AsyncWebServerRequest* request) {
+    Serial.printf("[http] PING from %s — webserver link OK\n",
+                  request->client()->remoteIP().toString().c_str());
+    StaticJsonDocument<128> doc;
+    doc["type"] = "pong";
+    doc["mac"] = appDeviceMac;
+    doc["fw"] = FW_VERSION; // the OTA flow polls this to confirm the new image booted
+    String out;
+    serializeJson(doc, out);
+    appHttpSendJson(request, 200, out);
+  });
+
   appServer.on("/cmd", HTTP_POST, [](AsyncWebServerRequest* request) {}, nullptr,
     [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
       if (!appHttpAuthorized(request)) { appHttpSendJson(request, 401, appBuildAck("cmd", false, "unauthorized")); return; }
@@ -1047,10 +1139,44 @@ inline void appHttpRegister() {
       if (deserializeJson(doc, data, len)) { appHttpSendJson(request, 400, appBuildAck("unknown", false, "bad json")); return; }
       const char* cmd = doc["cmd"] | "";
       if (strcmp(cmd, "getState") == 0) { appHttpSendJson(request, 200, appBuildStateJson()); return; }
-      // Re-pointing Wi-Fi over the network you're about to leave strands
-      // the device — provisioning stays BLE-only.
-      if (strcmp(cmd, "setWifi") == 0 || strcmp(cmd, "scanWifi") == 0 || strcmp(cmd, "forgetWifi") == 0) {
-        appHttpSendJson(request, 400, appBuildAck(cmd, false, "Wi-Fi setup is only available over Bluetooth"));
+      // Wi-Fi management over the LAN, for phones connected without a BLE
+      // link. Joining a different network (or forgetting this one) drops
+      // the HTTP transport mid-flight by nature — the app knows and falls
+      // back to BLE to pick the device up again.
+      if (strcmp(cmd, "scanWifi") == 0) {
+        if (_appwifi::pendingScan) { appHttpSendJson(request, 200, appBuildAck(cmd, false, "scan already in progress")); return; }
+        _appwifi::scanRequesterConn = APP_SCAN_HTTP;
+        appScanFresh = false;
+        _appwifi::pendingScan = true; // WiFi.scanNetworks() blocks; runs from loop()
+        appHttpSendJson(request, 200, appBuildAck(cmd, true, "scanning"));
+        return;
+      }
+      if (strcmp(cmd, "forgetWifi") == 0) {
+        _appwifi::pendingForget = true; // serviced from loop()
+        appHttpSendJson(request, 200, appBuildAck(cmd, true));
+        return;
+      }
+      if (strcmp(cmd, "setWifi") == 0) {
+        const char* ssid = doc["ssid"] | "";
+        const char* passEnc = doc["passEnc"] | "";
+        const char* passPlain = doc["pass"] | "";
+        if (strlen(ssid) == 0) { appHttpSendJson(request, 200, appBuildAck(cmd, false, "missing ssid")); return; }
+        char pass[65] = "";
+        if (strlen(passEnc) > 0) {
+          // Encrypted against the HTTP auth nonce (this session's challenge).
+          if (!appKeystreamDecrypt(appHttpNonce, passEnc, pass, sizeof(pass))) {
+            appHttpSendJson(request, 200, appBuildAck(cmd, false, "could not decrypt credentials"));
+            return;
+          }
+        } else {
+          strlcpy(pass, passPlain, sizeof(pass));
+        }
+        strlcpy(_appwifi::ssid, ssid, sizeof(_appwifi::ssid));
+        strlcpy(_appwifi::pass, pass, sizeof(_appwifi::pass));
+        _appwifi::configured = true;
+        _appwifi::pendingSave = true; // NVS writes stay on the loop task
+        _appwifi::pendingJoin = true;
+        appHttpSendJson(request, 200, appBuildAck(cmd, true, "connecting"));
         return;
       }
       bool changed = false;
@@ -1058,6 +1184,37 @@ inline void appHttpRegister() {
       appHttpSendJson(request, 200, ack);
       // markDirty() inside the accessors makes the loop broadcast to any
       // BLE-connected phones — no cross-task notify from here.
+    });
+
+  // OTA: raw firmware image as the POST body. Chunks stream into the
+  // inactive app slot; the final chunk verifies and schedules a reboot.
+  appServer.on("/update", HTTP_POST,
+    [](AsyncWebServerRequest* request) {
+      if (!appHttpAuthorized(request)) { appHttpSendJson(request, 401, appBuildAck("update", false, "unauthorized")); return; }
+      if (appOtaRefuseMsg) { appHttpSendJson(request, 409, appBuildAck("update", false, appOtaRefuseMsg)); return; }
+      if (Update.hasError()) { appHttpSendJson(request, 400, appBuildAck("update", false, "flash write failed — see serial log")); return; }
+      appHttpSendJson(request, 200, appBuildAck("update", true, "update verified — rebooting"));
+      appRebootAtMs = millis() + 1500; // let the response leave first
+    },
+    NULL,
+    [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+      if (index == 0) {
+        appOtaRefuseMsg = nullptr;
+        if (!appHttpAuthorized(request)) { appOtaRefuseMsg = "unauthorized"; return; }
+        if (appAnyPumpRunning()) {
+          Serial.println("[ota] REFUSED: a pump is running — stop pumps/schedules first");
+          appOtaRefuseMsg = "a pump is running — turn pumps and pump schedules off first";
+          return;
+        }
+        Serial.printf("[ota] receiving firmware image (%u bytes)\n", (unsigned)total);
+        if (!Update.begin(total)) { Update.printError(Serial); return; }
+      }
+      if (appOtaRefuseMsg || Update.hasError()) return;
+      if (Update.write(data, len) != len) { Update.printError(Serial); return; }
+      if (index + len == total) {
+        if (Update.end(true)) Serial.printf("[ota] image verified (%u bytes) — reboot pending\n", (unsigned)total);
+        else Update.printError(Serial);
+      }
     });
 
   appServer.onNotFound([](AsyncWebServerRequest* request) {
@@ -1069,13 +1226,46 @@ inline void appHttpRegister() {
 //  DEFERRED WI-FI WORK  (loop() only)
 // ============================================================
 inline void appServiceWifiScan() {
-  if (!_appwifi::pendingScan) return;
-  _appwifi::pendingScan = false;
-  AppSession* s = appSessionByHandle(_appwifi::scanRequesterConn);
-  if (!s || !s->authed) return;
-  Serial.println("[wifi] scanning...");
-  if (_appwifi::phase == APPWIFI_UNCONFIGURED) WiFi.mode(WIFI_STA);
-  int n = WiFi.scanNetworks();
+  // The scan is ASYNC on purpose: the old blocking WiFi.scanNetworks()
+  // froze loop() for seconds (HTTP polls timed out, so the app demoted
+  // off Wi-Fi mid-scan) and a blocking scan with the STA connected often
+  // aborts with zero results. Async keeps the link and the loop alive.
+  static bool scanRunning = false;
+  static uint16_t scanConn = 0;
+
+  if (_appwifi::pendingScan && !scanRunning) {
+    _appwifi::pendingScan = false;
+    scanConn = _appwifi::scanRequesterConn;
+    if (scanConn != APP_SCAN_HTTP) {
+      AppSession* s = appSessionByHandle(scanConn);
+      if (!s || !s->authed) return;
+    }
+    Serial.println("[wifi] scan started (async — STA link stays up)");
+    if (_appwifi::phase == APPWIFI_UNCONFIGURED) WiFi.mode(WIFI_STA);
+    // 120ms per channel (default 300ms): the radio hops off the AP's
+    // channel only briefly per step, so the association — and the HTTP
+    // transport riding on it — survives the sweep, the way phones scan
+    // while staying connected.
+    WiFi.scanNetworks(true /*async*/, false /*hidden*/, false /*passive*/, 120 /*ms per channel*/);
+    scanRunning = true;
+    return;
+  }
+  if (!scanRunning) return;
+
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return; // still working — check again next pass
+  static bool retriedFail = false;
+  if (n < 0 && !retriedFail) {
+    // The first async attempt right after a mode change / while the STA is
+    // busy can fail outright — retry once instead of reporting nothing.
+    retriedFail = true;
+    Serial.println("[wifi] scan failed — retrying once");
+    WiFi.scanNetworks(true, false, false, 120);
+    return; // scanRunning stays true
+  }
+  retriedFail = false;
+  scanRunning = false;
+  if (n < 0) n = 0;
   Serial.printf("[wifi] %d networks found\n", n);
   DynamicJsonDocument doc(2048);
   doc["type"] = "wifiScan";
@@ -1091,7 +1281,37 @@ inline void appServiceWifiScan() {
   WiFi.scanDelete();
   String out;
   serializeJson(doc, out);
-  appSendChunkedTo(s, out);
+  // Cached for HTTP pollers (GET /wifiScan).
+  appLastScanJson = out;
+  appScanFresh = true;
+  if (scanConn != APP_SCAN_HTTP) {
+    AppSession* s = appSessionByHandle(scanConn);
+    if (s && s->authed) {
+      // One SMALL single-notify frame per network plus an end marker —
+      // the old single multi-chunk push was torn by radio contention
+      // often enough that the list regularly arrived empty and the user
+      // had to mash Rescan. Small frames survive (same fix as pump events).
+      int i = 0;
+      for (JsonObject net : arr) {
+        StaticJsonDocument<224> nd;
+        nd["type"] = "wifiNet";
+        nd["i"] = i++;
+        nd["count"] = limit;
+        nd["ssid"] = net["ssid"];
+        nd["rssi"] = net["rssi"];
+        nd["secure"] = net["secure"];
+        String o;
+        serializeJson(nd, o);
+        appSendChunkedTo(s, o);
+      }
+      StaticJsonDocument<96> fin;
+      fin["type"] = "wifiScanEnd";
+      fin["count"] = limit;
+      String fo;
+      serializeJson(fin, fo);
+      appSendChunkedTo(s, fo);
+    }
+  }
 }
 
 inline void appWifiTick() {
@@ -1231,6 +1451,23 @@ inline void appLinkBegin() {
   else Serial.println("!!! BLE advertising FAILED to start — device is invisible");
 
   Serial.printf("[app] device MAC (identity): %s\n", appDeviceMac);
+
+  // Record the running firmware version in NVS ("eeprom") — the first
+  // boot after an OTA logs the transition, and the stored value survives
+  // for diagnostics even if a later image fails to report properly.
+  {
+    _state::prefs.begin("relaytimer", false);
+    String prev = _state::prefs.getString("fwver", "");
+    if (prev != FW_VERSION) {
+      Serial.printf("[ota] firmware version: %s -> %s\n",
+                    prev.length() ? prev.c_str() : "(first boot)", FW_VERSION);
+      _state::prefs.putString("fwver", FW_VERSION);
+    } else {
+      Serial.printf("[app] firmware version %s\n", FW_VERSION);
+    }
+    _state::prefs.end();
+  }
+
   appPrintQrPayload();
 }
 
@@ -1239,6 +1476,13 @@ inline void appLinkLoop() {
   static unsigned long lastBroadcastMs = 0;
   static unsigned long lastHeartbeatMs = 0;
   unsigned long nowMs = millis();
+
+  // A verified OTA image reboots from here, after its HTTP response left.
+  if (appRebootAtMs && nowMs > appRebootAtMs) {
+    Serial.println("[ota] rebooting into the new firmware");
+    delay(50);
+    ESP.restart();
+  }
 
   // Auth deadline: a connection that never completes the HMAC challenge
   // may not camp on a session slot.
@@ -1254,6 +1498,45 @@ inline void appLinkLoop() {
   if (millis() < _appwifi::announceUntilMs && millis() - _appwifi::lastAnnounceMs > 2000) {
     _appwifi::lastAnnounceMs = millis();
     appBroadcastWifiEvent();
+  }
+
+  // Pump confirmations ride a small dedicated frame (see
+  // appBroadcastPumpEvent) — detected here by diffing the dispatcher's
+  // confirmed state against the last snapshot sent.
+  {
+    static bool     lastPumpActive[MAX_PUMPS];
+    static uint16_t lastPumpSpeed[MAX_PUMPS];
+    static int8_t   lastPumpName[MAX_PUMPS];
+    static unsigned long pumpRetryAtMs[MAX_PUMPS] = {0, 0, 0, 0};
+    static bool     pumpSnapInit = false;
+    for (int i = 1; i <= MAX_PUMPS; i++) {
+      bool a; uint16_t sp;
+      pumpActualStateGet(i, a, sp);
+      int8_t nameIdx = pumpNameIndexGet(i);
+      if (!pumpSnapInit) {
+        lastPumpActive[i - 1] = a;
+        lastPumpSpeed[i - 1] = sp;
+        lastPumpName[i - 1] = nameIdx;
+        continue;
+      }
+      bool changed = (a != lastPumpActive[i - 1] || sp != lastPumpSpeed[i - 1] ||
+                      nameIdx != lastPumpName[i - 1]);
+      if (!changed) continue;
+      if (nowMs < pumpRetryAtMs[i - 1]) continue; // last notify dropped — brief backoff
+      if (appBroadcastPumpEvent(i, a, sp)) {
+        // Consumed only on successful delivery to every authed session.
+        lastPumpActive[i - 1] = a;
+        lastPumpSpeed[i - 1] = sp;
+        lastPumpName[i - 1] = nameIdx;
+        pumpRetryAtMs[i - 1] = 0;
+      } else {
+        // Dropped by the congested radio — keep the change queued so it
+        // re-fires until it lands. Consuming it here left BLE phones
+        // stuck on "Turning on…" while the pump was confirmed running.
+        pumpRetryAtMs[i - 1] = nowMs + 250;
+      }
+    }
+    pumpSnapInit = true;
   }
 
   // Push state to BLE phones when it changes (the same version counter

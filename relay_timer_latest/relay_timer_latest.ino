@@ -1,3 +1,9 @@
+// Firmware version — bump on EVERY release. The app compares this (as
+// reported by the running device) against the GitHub manifest to decide
+// whether to offer an OTA update, and the manifest's "version" must match
+// this string exactly or the update loop never settles.
+#define FW_VERSION "1.0.1"
+
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 
@@ -168,12 +174,12 @@ void setup() {
 #if DISPLAY_TYPE
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("SSD1306 init failed");
-    for (;;) delay(1000);
+    delay(1000);
   }
 #else
   if (!display.begin(OLED_ADDR, true)) {
     Serial.println("SH1106 init failed");
-    for (;;) delay(1000);
+    delay(1000);
   }
 #endif
 
@@ -1076,9 +1082,14 @@ void manualRowLabel(int rowIdx, char* out, size_t outLen) {
   int rt = manualRowType[rowIdx];
   int p  = manualRowPump[rowIdx];
   switch (rt) {
-    case MR_RELAY1: snprintf(out, outLen, "Relay 1: %s", modeStr(relayModeGet(1))); break;
-    case MR_RELAY2: snprintf(out, outLen, "Relay 2: %s", modeStr(relayModeGet(2))); break;
-    case MR_RELAY3: snprintf(out, outLen, "Relay 3: %s", modeStr(relayModeGet(3))); break;
+    case MR_RELAY1:
+    case MR_RELAY2:
+    case MR_RELAY3: {
+      int rn = rt - MR_RELAY1 + 1;
+      char name[13]; relayDisplayName(rn, name, sizeof(name));
+      snprintf(out, outLen, "%s: %s", name, modeStr(relayModeGet(rn)));
+      break;
+    }
     case MR_PUMP_MODE: {
       char name[13]; pumpDisplayName(p + 1, name, sizeof(name));
       snprintf(out, outLen, "%s: %s", name, modeStr(pumpModeGet(p + 1)));
