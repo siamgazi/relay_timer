@@ -79,10 +79,27 @@ inline void rtcResync() {
   clockSetFromRTC(now.hour(), now.minute(), now.second());
 }
 
-// User-initiated time change (OLED "Set Time" screen, or the
-// webserver's /api/settime) -- updates the live clock AND persists to
-// the RTC so it's remembered across the next power cycle.
+// User-initiated time change (OLED "Set Time" screen, or the app's
+// setTime command) -- updates the live clock immediately AND queues the
+// RTC write so it's remembered across the next power cycle.
+//
+// The RTC write is DEFERRED to loop(): setTime arrives on the BLE/HTTP
+// tasks, but Wire is also mid-flight there every OLED redraw and has no
+// cross-task lock -- an interleaved transaction garbles the frame or
+// corrupts the RTC write. rtcServicePendingWrite() below does the I2C.
+volatile bool    rtcPendingWrite = false;
+volatile uint8_t rtcPendingH = 0, rtcPendingM = 0;
+
 inline void setDeviceTime(uint8_t h, uint8_t m) {
   clockSetManual(h, m);
-  rtcWriteTime(h, m, 0);
+  rtcPendingH = h;
+  rtcPendingM = m;
+  rtcPendingWrite = true;
+}
+
+// Call every loop() iteration (same task as the OLED redraw).
+inline void rtcServicePendingWrite() {
+  if (!rtcPendingWrite) return;
+  rtcPendingWrite = false;
+  rtcWriteTime(rtcPendingH, rtcPendingM, 0);
 }

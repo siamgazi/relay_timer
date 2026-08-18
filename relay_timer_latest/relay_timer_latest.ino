@@ -208,6 +208,7 @@ void loop() {
   }
 
   rtcResync(); // no-op most ticks; periodically re-aligns against the DS3231
+  rtcServicePendingWrite(); // flushes an app setTime's RTC write on the loop task
 
   // App connectivity: Wi-Fi state machine (starts the HTTP API when the
   // network comes up), BLE auth deadlines, and state broadcasts to any

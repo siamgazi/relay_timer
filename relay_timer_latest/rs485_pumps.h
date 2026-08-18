@@ -168,6 +168,7 @@ struct PumpVerify {
     bool     everSent = false;     // first send of the current goal already logged
     bool     pollLogged = false;   // first status poll already logged
     bool     resendLogged = false;
+    bool     lastSendFailed = false; // no echo — pump likely offline; pace the retries
     uint8_t  resends = 0;          // correction attempts for the current goal
     uint32_t lastSendMs = 0;
     uint32_t lastPollMs = 0;
@@ -241,10 +242,10 @@ inline void rs485Send(const uint8_t *frame, uint8_t len) {
 // anchor-and-close the window. Used by Pentair and Emaux only — the
 // Black & Decker path never reads RX at all.
 inline uint8_t rs485Receive(uint8_t *buf, uint8_t maxLen, uint16_t timeoutMs) {
-    unsigned long deadline = millis() + timeoutMs;
+    unsigned long startMs = millis();
     while (true) {
         while (!RS485_SERIAL.available()) {
-            if (millis() > deadline) {
+            if (millis() - startMs > timeoutMs) {
                 DBG_PRINTLN("[RS485] RX timeout: no bytes received");
                 return 0;
             }
@@ -272,7 +273,15 @@ inline uint8_t rs485Receive(uint8_t *buf, uint8_t maxLen, uint16_t timeoutMs) {
             memmove(buf, buf + skip, idx - skip);
             idx -= skip;
         }
-        if (idx == 0) continue; // pure glitch — the real reply may still come
+        if (idx == 0) {
+            // Pure glitch — the real reply may still come. But a bus fault
+            // streaming continuous zeros must not loop past the deadline.
+            if (millis() - startMs > timeoutMs) {
+                DBG_PRINTLN("[RS485] RX timeout: nothing but glitch bytes");
+                return 0;
+            }
+            continue;
+        }
 
         DBG_PRINT("[RS485] RX (");
         DBG_PRINT(idx);
@@ -615,6 +624,7 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
         ver.everSent = false;
         ver.pollLogged = false;
         ver.resendLogged = false;
+        ver.lastSendFailed = false;
         ver.resends = 0;
     }
     if (ver.gaveUp) return; // resend budget spent — waiting for a new goal
@@ -632,6 +642,10 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
 
     if (!ver.awaiting || ver.resendDue) {
         // ---- Phase 1: send, confirmed by echo ----------------------
+        // Each send blocks on the RS-485 reply timeout, so an offline pump
+        // must not be re-attempted every loop pass — pace failed sends the
+        // same way mismatched readbacks are paced.
+        if (ver.lastSendFailed && nowMs - ver.lastSendMs < VERIFY_RESEND_MS) return;
         bool verboseSend = verboseAttempt && !ver.everSent;
 #if RS485_DEBUG
         bool dbgSave = rs485DebugEnabled;
@@ -672,15 +686,30 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
             ver.awaiting = true;
             ver.resendDue = false;
             ver.everSent = true;
+            ver.lastSendFailed = false;
             ver.lastSendMs = nowMs;
             ver.lastPollMs = nowMs; // first status poll one interval from now
             memo.failLogged = false;
             if (verboseSend)
                 DBG_PRINTF("[Dispatcher] pump %u: command echoed OK — awaiting readback confirmation\n", pumpId);
-        } else if (!memo.failLogged) {
-            memo.failLogged = true;
-            DBG_PRINTF("[Dispatcher] pump %u: command FAILED — retrying silently until it confirms or the request changes\n",
-                       pumpId);
+        } else {
+            // No echo at all: spend the same budget as mismatched readbacks
+            // so a dead pump eventually idles instead of stalling the loop
+            // on the reply timeout until the end of time.
+            ver.lastSendFailed = true;
+            ver.lastSendMs = nowMs;
+            if (ver.resends >= VERIFY_MAX_RESENDS) {
+                ver.gaveUp = true;
+                DBG_PRINTF("[Dispatcher] pump %u: no echo after %u attempts — giving up until the goal changes\n",
+                           pumpId, (unsigned)(VERIFY_MAX_RESENDS + 1));
+            } else {
+                ver.resends++;
+                if (!memo.failLogged) {
+                    memo.failLogged = true;
+                    DBG_PRINTF("[Dispatcher] pump %u: command FAILED — retrying silently until it confirms or the request changes\n",
+                               pumpId);
+                }
+            }
         }
         return;
     }

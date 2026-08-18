@@ -84,6 +84,11 @@ namespace _state {
   // relays AND pumps. ---
   int8_t relayNameIndex[MAX_RELAYS] = {-1, -1, -1};
   volatile bool pendingRelayNameSave = false;
+
+  // Preset saves are deferred to loop() like the flags above: the accessors
+  // run on the BLE and HTTP tasks too, and the single Preferences object
+  // must never be driven from two tasks at once.
+  volatile bool pendingPresetSave = false;
 }
 
 // 1. Put markDirty back on the list so everyone can use it
@@ -143,6 +148,8 @@ inline void processPendingSaves() {
   int8_t nameSnapshot[MAX_PUMPS];
   bool doRelayNameSave = false;
   int8_t relayNameSnapshot[MAX_RELAYS];
+  bool doPresetSave = false;
+  static Preset presetSnapshot[MAX_PRESETS]; // loop()-only; too big for the stack
 
   {
     StateLock lock;
@@ -150,6 +157,11 @@ inline void processPendingSaves() {
       doSave = true;
       valToSave = _state::relay2DependsOn1;
       _state::pendingDepSave = false;
+    }
+    if (_state::pendingPresetSave) {
+      doPresetSave = true;
+      memcpy(presetSnapshot, _state::presets, sizeof(presetSnapshot));
+      _state::pendingPresetSave = false;
     }
     if (_state::pendingPumpNameSave) {
       doNameSave = true;
@@ -176,6 +188,11 @@ inline void processPendingSaves() {
   if (doRelayNameSave) {
     _state::prefs.begin("relaytimer", false);
     _state::prefs.putBytes("relayNames", relayNameSnapshot, sizeof(relayNameSnapshot));
+    _state::prefs.end();
+  }
+  if (doPresetSave) {
+    _state::prefs.begin("relaytimer", false);
+    _state::prefs.putBytes("presets", presetSnapshot, sizeof(presetSnapshot));
     _state::prefs.end();
   }
 }
@@ -232,8 +249,8 @@ inline bool presetWrite(int slot, const Preset &p) {
     StateLock lock;
     _state::presets[slot] = p;
     _state::presets[slot].used = true;
+    _state::pendingPresetSave = true;
   }
-  savePresetsToFlash();
   markDirty();
   return true;
 }
@@ -243,8 +260,8 @@ inline bool presetDelete(int slot) {
   {
     StateLock lock;
     _state::presets[slot].used = false;
+    _state::pendingPresetSave = true;
   }
-  savePresetsToFlash();
   markDirty();
   return true;
 }
@@ -255,8 +272,8 @@ inline bool presetSetEnabled(int slot, bool en) {
     StateLock lock;
     if (!_state::presets[slot].used) return false;
     _state::presets[slot].enabled = en;
+    _state::pendingPresetSave = true;
   }
-  savePresetsToFlash();
   markDirty();
   return true;
 }

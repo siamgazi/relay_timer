@@ -184,6 +184,7 @@ struct AppSession {
   bool     inUse;
   uint16_t connHandle;
   bool     authed;
+  bool     dropPending; // loop() asked for a disconnect; free happens in onDisconnect
   char     nonceHex[33]; // kept after auth — the setWifi keystream derives from it
   bool     nonceIssued;
   uint32_t connectedAtMs;
@@ -260,6 +261,12 @@ namespace _appwifi {
   volatile bool pendingScan = false;
   uint16_t scanRequesterConn = 0;
 }
+
+// Latest completed Wi-Fi scan, cached for the app's GET /wifiScan poll.
+// `appScanFresh` marks it current — every new scan request (BLE or HTTP)
+// must clear it, or the poll is served the previous scan's list.
+String appLastScanJson;
+volatile bool appScanFresh = false;
 
 inline const char* appWifiPhaseStr() {
   switch (_appwifi::phase) {
@@ -399,7 +406,10 @@ inline void appCountdownText(uint8_t target, char* out, size_t outLen) {
 }
 
 inline String appBuildStateJson() {
-  DynamicJsonDocument doc(3072);
+  // 8 presets + 4 pumps + 3 relays + countdown strings need ~2.8 KB of
+  // pool at worst; on overflow ArduinoJson silently DROPS members, so
+  // keep real headroom.
+  DynamicJsonDocument doc(4096);
   doc["type"] = "state";
   doc["mac"] = appDeviceMac;   // stable device identity — the app keys its registry on this
   doc["name"] = appBleName;
@@ -503,6 +513,19 @@ inline String appBuildAck(const char* cmd, bool ok, const char* message = "") {
   return out;
 }
 
+// "p<slot>" -> slot index, or -1. Anything else ("p", "pxyz", the app's
+// optimistic "local-…" ids) used to atoi() to 0 and silently hit preset 0.
+inline int appParsePresetId(const char* id) {
+  if (!id || id[0] != 'p' || id[1] == '\0') return -1;
+  int slot = 0;
+  for (const char* c = id + 1; *c; c++) {
+    if (*c < '0' || *c > '9') return -1;
+    slot = slot * 10 + (*c - '0');
+    if (slot >= MAX_PRESETS) return -1;
+  }
+  return slot;
+}
+
 // Applies a relay/pump/schedule/time command to _state through the same
 // accessors the OLED uses (they handle StateLock, markDirty and the
 // flash saves). `changed` tells the caller a state broadcast is due —
@@ -601,20 +624,27 @@ inline String appExecuteCommand(JsonDocument& doc, bool& changed) {
       p.speed = 2000; // pump presets need a speed; the OLED can refine it
     } else {
       const char* id = doc["id"] | "";
-      if (id[0] != 'p') return appBuildAck(cmd, false, "no such schedule");
-      slot = atoi(id + 1);
-      if (!presetGet(slot, p) || !p.used) return appBuildAck(cmd, false, "no such schedule");
+      slot = appParsePresetId(id);
+      if (slot < 0 || !presetGet(slot, p) || !p.used) return appBuildAck(cmd, false, "no such schedule");
     }
     JsonObject sched = doc["schedule"];
     int target = appTargetParse(sched["target"] | "Relay 1");
     if (target < 0) return appBuildAck(cmd, false, "bad target");
     int durationMin = sched["durationMin"] | 60;
     if (durationMin <= 0) return appBuildAck(cmd, false, "duration must be > 0");
+    // Same bounds the web preset editor enforced: 23h59m max (anything
+    // longer wraps isWithinSchedule into a 24/7 schedule) and a start
+    // time that actually exists (out-of-range hours silently never fire).
+    if (durationMin > 23 * 60 + 59) return appBuildAck(cmd, false, "invalid duration");
+    int startHour = sched["hour24"] | 6;
+    int startMinute = sched["minute"] | 0;
+    if (startHour < 0 || startHour > 23 || startMinute < 0 || startMinute > 59)
+      return appBuildAck(cmd, false, "invalid start time");
     p.used = true;
     p.enabled = sched["enabled"] | true;
     p.target = (uint8_t)target;
-    p.startHour = sched["hour24"] | 6;
-    p.startMinute = sched["minute"] | 0;
+    p.startHour = (uint8_t)startHour;
+    p.startMinute = (uint8_t)startMinute;
     p.durHour = durationMin / 60;
     p.durMinute = durationMin % 60;
     // Per-preset pump parameters (mirrors the web preset editor). Absent
@@ -637,7 +667,8 @@ inline String appExecuteCommand(JsonDocument& doc, bool& changed) {
 
   if (strcmp(cmd, "deleteSchedule") == 0) {
     const char* id = doc["id"] | "";
-    if (id[0] != 'p' || !presetDelete(atoi(id + 1)))
+    int slot = appParsePresetId(id);
+    if (slot < 0 || !presetDelete(slot))
       return appBuildAck(cmd, false, "no such schedule");
     Serial.printf("[cmd] schedule deleted %s\n", id);
     changed = true;
@@ -656,7 +687,8 @@ inline String appExecuteCommand(JsonDocument& doc, bool& changed) {
   if (strcmp(cmd, "toggleSchedule") == 0) {
     const char* id = doc["id"] | "";
     bool en = doc["enabled"] | true;
-    if (id[0] != 'p' || !presetSetEnabled(atoi(id + 1), en))
+    int slot = appParsePresetId(id);
+    if (slot < 0 || !presetSetEnabled(slot, en))
       return appBuildAck(cmd, false, "no such schedule");
     Serial.printf("[cmd] schedule %s %s\n", id, en ? "enabled" : "disabled");
     changed = true;
@@ -885,6 +917,7 @@ inline void appHandleCommand(AppSession* s, const String& msg) {
   if (strcmp(cmd, "scanWifi") == 0) {
     if (_appwifi::pendingScan) { appSendAckTo(s, cmd, false, "scan already in progress"); return; }
     _appwifi::scanRequesterConn = s->connHandle;
+    appScanFresh = false; // or the app's HTTP fallback poll is served the PREVIOUS scan
     _appwifi::pendingScan = true; // WiFi.scanNetworks() blocks; run from loop()
     appSendAckTo(s, cmd, true, "scanning");
     return;
@@ -989,6 +1022,7 @@ bool appServerStarted = false;
 struct AppHttpSession {
   bool     inUse;
   char     token[33];
+  char     nonce[33];   // the challenge nonce this token was authenticated with
   uint32_t issuedAtMs;
 };
 AppHttpSession appHttpSessions[APP_MAX_HTTP_SESSIONS];
@@ -1018,8 +1052,6 @@ inline bool appAnyPumpRunning() {
 // the results, so the loop stores the latest scan here and the app polls
 // GET /wifiScan for it. The sentinel marks "requested via HTTP".
 #define APP_SCAN_HTTP 0xFFFF
-String appLastScanJson;
-volatile bool appScanFresh = false;
 bool appHttpNonceIssued = false;
 
 inline bool appHttpTokenValid(const char* token) {
@@ -1046,9 +1078,30 @@ inline const char* appHttpIssueToken() {
       if (appHttpSessions[i].issuedAtMs < oldest) { oldest = appHttpSessions[i].issuedAtMs; slot = i; }
   }
   appMakeNonce(appHttpSessions[slot].token);
+  // Bind the challenge nonce to this session: Wi-Fi passwords are keystream-
+  // encrypted against it, and another client pulling /challenge must not
+  // rotate it out from under us (that desync read as "wrong password").
+  strlcpy(appHttpSessions[slot].nonce, appHttpNonce, sizeof(appHttpSessions[slot].nonce));
   appHttpSessions[slot].inUse = true;
   appHttpSessions[slot].issuedAtMs = millis();
   return appHttpSessions[slot].token;
+}
+
+// The nonce the presenting bearer token was authenticated with; falls back
+// to the global slot for malformed requests (setWifi is auth-gated anyway).
+inline const char* appHttpSessionNonce(AsyncWebServerRequest* request) {
+  if (request->hasHeader("Authorization")) {
+    String h = request->header("Authorization");
+    if (h.startsWith("Bearer ")) {
+      String t = h.substring(7);
+      if (t.length() == 32) {
+        for (int i = 0; i < APP_MAX_HTTP_SESSIONS; i++)
+          if (appHttpSessions[i].inUse && appCtEquals(appHttpSessions[i].token, t.c_str(), 32))
+            return appHttpSessions[i].nonce;
+      }
+    }
+  }
+  return appHttpNonce;
 }
 
 inline bool appHttpAuthorized(AsyncWebServerRequest* request) {
@@ -1079,7 +1132,10 @@ inline void appHttpRegister() {
 
   appServer.on("/auth", HTTP_POST, [](AsyncWebServerRequest* request) {}, nullptr,
     [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
-      if (index != 0 || len != total) { appHttpSendJson(request, 400, appBuildAck("auth", false, "body too large")); return; }
+      // This callback fires once per TCP segment — later segments of a
+      // too-large body must stay silent, or one request gets two sends.
+      if (index != 0) return; // already rejected on the first segment
+      if (len != total) { appHttpSendJson(request, 400, appBuildAck("auth", false, "body too large")); return; }
       if (!appHttpNonceIssued) { appHttpSendJson(request, 403, appBuildAck("auth", false, "no challenge issued")); return; }
       DynamicJsonDocument doc(256);
       if (deserializeJson(doc, data, len)) { appHttpSendJson(request, 400, appBuildAck("auth", false, "bad json")); return; }
@@ -1133,8 +1189,11 @@ inline void appHttpRegister() {
 
   appServer.on("/cmd", HTTP_POST, [](AsyncWebServerRequest* request) {}, nullptr,
     [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+      // Fires once per TCP segment — reply on the first segment only, or
+      // one request gets two sends (reachable pre-auth from the LAN).
+      if (index != 0) return; // already answered on the first segment
       if (!appHttpAuthorized(request)) { appHttpSendJson(request, 401, appBuildAck("cmd", false, "unauthorized")); return; }
-      if (index != 0 || len != total) { appHttpSendJson(request, 400, appBuildAck("cmd", false, "body too large")); return; }
+      if (len != total) { appHttpSendJson(request, 400, appBuildAck("cmd", false, "body too large")); return; }
       DynamicJsonDocument doc(1024);
       if (deserializeJson(doc, data, len)) { appHttpSendJson(request, 400, appBuildAck("unknown", false, "bad json")); return; }
       const char* cmd = doc["cmd"] | "";
@@ -1164,7 +1223,7 @@ inline void appHttpRegister() {
         char pass[65] = "";
         if (strlen(passEnc) > 0) {
           // Encrypted against the HTTP auth nonce (this session's challenge).
-          if (!appKeystreamDecrypt(appHttpNonce, passEnc, pass, sizeof(pass))) {
+          if (!appKeystreamDecrypt(appHttpSessionNonce(request), passEnc, pass, sizeof(pass))) {
             appHttpSendJson(request, 200, appBuildAck(cmd, false, "could not decrypt credentials"));
             return;
           }
@@ -1207,7 +1266,15 @@ inline void appHttpRegister() {
           return;
         }
         Serial.printf("[ota] receiving firmware image (%u bytes)\n", (unsigned)total);
-        if (!Update.begin(total)) { Update.printError(Serial); return; }
+        // A previous upload that died mid-flight leaves Update running; begin()
+        // would fail and later chunks would then append this image's bytes into
+        // the stale session — end(true) could boot that mix. Start clean.
+        if (Update.isRunning()) Update.abort();
+        if (!Update.begin(total)) {
+          Update.printError(Serial);
+          appOtaRefuseMsg = "could not start update — see serial log";
+          return;
+        }
       }
       if (appOtaRefuseMsg || Update.hasError()) return;
       if (Update.write(data, len) != len) { Update.printError(Serial); return; }
@@ -1478,18 +1545,27 @@ inline void appLinkLoop() {
   unsigned long nowMs = millis();
 
   // A verified OTA image reboots from here, after its HTTP response left.
-  if (appRebootAtMs && nowMs > appRebootAtMs) {
+  // Signed diff: `nowMs > appRebootAtMs` misfires when the deadline was set
+  // just before the 49.7-day millis() wrap (premature reboot mid-response).
+  if (appRebootAtMs && (int32_t)(nowMs - appRebootAtMs) >= 0) {
     Serial.println("[ota] rebooting into the new firmware");
     delay(50);
     ESP.restart();
   }
 
   // Auth deadline: a connection that never completes the HMAC challenge
-  // may not camp on a session slot.
+  // may not camp on a session slot. Only REQUEST the disconnect from here:
+  // freeing the session (its String rx buffer) must stay on the NimBLE
+  // task, where onWrite may be appending to that buffer right now —
+  // onDisconnect does the actual appFreeSession.
   for (int i = 0; i < APP_MAX_SESSIONS; i++) {
     AppSession* s = &appSessions[i];
-    if (s->inUse && !s->authed && nowMs - s->connectedAtMs > APP_AUTH_TIMEOUT_MS)
-      appDropSession(s, "auth timeout");
+    if (s->inUse && !s->authed && !s->dropPending && nowMs - s->connectedAtMs > APP_AUTH_TIMEOUT_MS) {
+      Serial.printf("[auth] conn %u dropped: auth timeout\n", s->connHandle);
+      s->dropPending = true;
+      if (!appBleServer || !appBleServer->disconnect(s->connHandle))
+        appFreeSession(s->connHandle); // no live link — nothing can be writing
+    }
   }
 
   appWifiTick();

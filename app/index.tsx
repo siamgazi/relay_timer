@@ -286,13 +286,30 @@ const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345678
 function utf8Bytes(str: string): number[] {
   const bytes: number[] = [];
   for (let i = 0; i < str.length; i++) {
-    const code = str.charCodeAt(i);
+    let code = str.charCodeAt(i);
+    // Fold surrogate pairs into the real code point — encoding the halves
+    // separately yields CESU-8 the firmware's UTF-8 can't match (an emoji
+    // in an SSID/password would fail the join with no useful error).
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
+      const lo = str.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) {
+        code = 0x10000 + ((code - 0xd800) << 10) + (lo - 0xdc00);
+        i++;
+      }
+    }
     if (code < 0x80) {
       bytes.push(code);
     } else if (code < 0x800) {
       bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
-    } else {
+    } else if (code < 0x10000) {
       bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    } else {
+      bytes.push(
+        0xf0 | (code >> 18),
+        0x80 | ((code >> 12) & 0x3f),
+        0x80 | ((code >> 6) & 0x3f),
+        0x80 | (code & 0x3f)
+      );
     }
   }
   return bytes;
@@ -339,10 +356,18 @@ function base64ToUtf8(b64: string): string {
     } else if (b0 >> 5 === 0x6) {
       const b1 = bytes[i++];
       out += String.fromCharCode(((b0 & 0x1f) << 6) | (b1 & 0x3f));
-    } else {
+    } else if (b0 >> 4 === 0xe) {
       const b1 = bytes[i++];
       const b2 = bytes[i++];
       out += String.fromCharCode(((b0 & 0xf) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f));
+    } else {
+      // 4-byte lead (non-BMP) — was misread as a 3-byte sequence before.
+      const b1 = bytes[i++];
+      const b2 = bytes[i++];
+      const b3 = bytes[i++];
+      out += String.fromCodePoint(
+        ((b0 & 0x7) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f)
+      );
     }
   }
   return out;
@@ -759,7 +784,9 @@ function waitForPoweredOn(manager: BleManager): Promise<boolean> {
         }
       }, true);
       setTimeout(() => { sub.remove(); resolve(false); }, 5000);
-    });
+      // A state() failure must resolve too — a pending promise here would
+      // wedge the connect flow with connectInFlightRef stuck true.
+    }).catch(() => resolve(false));
   });
 }
 
@@ -893,7 +920,9 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       });
     }
 
-    if (msg.relays) {
+    // Array checks (like wifiScan below): a torn-but-parseable frame with a
+    // non-array field would otherwise throw inside the notify callback.
+    if (Array.isArray(msg.relays)) {
       setRelays((prev) =>
         prev.map((r) => {
           const found = msg.relays.find((x: any) => x.id === r.id);
@@ -902,7 +931,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         })
       );
     }
-    if (msg.pumps) {
+    if (Array.isArray(msg.pumps)) {
       setPumps((prev) =>
         prev.map((p) => {
           const found = msg.pumps.find((x: any) => x.id === p.id);
@@ -921,7 +950,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         })
       );
     }
-    if (msg.schedules) {
+    if (Array.isArray(msg.schedules)) {
       setPresets(
         msg.schedules.map((s: any) => ({
           id: s.id,
@@ -933,7 +962,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
           minute: s.minute,
           durationMin: s.durationMin,
           speedRpm: typeof s.speedRpm === 'number' ? s.speedRpm : 2000,
-          pumpType: s.pumpType === 'Emaux' ? 'Emaux' as PumpType : 'Pentair' as PumpType,
+          pumpType: (s.pumpType === 'Emaux' || s.pumpType === 'Black & Decker' ? s.pumpType : 'Pentair') as PumpType,
         }))
       );
     }
@@ -1089,7 +1118,8 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   // ---- send a command over whichever transport is currently active ----
   // Wi-Fi is preferred; if it fails mid-flight the command is retried over
   // BLE when that link is also up, so a router hiccup doesn't lose a tap.
-  const sendCommand = useCallback(async (cmd: object) => {
+  //
+  const sendCommandNow = useCallback(async (cmd: object) => {
     const http = httpRef.current;
 
     if (transportRef.current === 'wifi' && http) {
@@ -1119,9 +1149,25 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     }
   }, [writeLine]);
 
+  // Commands are SERIALIZED through this queue. Over HTTP, two rapid
+  // sendCommand calls ("Turn on" fires setPumpConfig then setPumpMode)
+  // used to race as parallel POSTs on separate connections — if the mode
+  // flip landed first, the pump started with the previous set-point/type.
+  const cmdQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const sendCommand = useCallback((cmd: object) => {
+    const run = () => sendCommandNow(cmd);
+    const next = cmdQueueRef.current.then(run, run);
+    cmdQueueRef.current = next;
+    return next;
+  }, [sendCommandNow]);
+
   const disconnect = useCallback(async (opts?: { keepWifiUi?: boolean }) => {
     const device = deviceRef.current;
     connectGenRef.current += 1; // invalidate every in-flight callback of the old session
+    // A superseded attempt's scan callbacks deliberately never touch the
+    // scanner (they'd kill a successor's scan) — so the scan a still-running
+    // attempt owns must be stopped HERE, or it leaks and runs forever.
+    try { _bleManager?.stopDeviceScan(); } catch {}
     isConnectedRef.current = false;
     setBleUp(false);
     setDeviceFw(null); // stale pre-disconnect version must not drive update prompts
@@ -1278,13 +1324,26 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       // setting the error state here: the caller knows whether this attempt
       // can fall back (the stale-reuse path retries with a fresh scan) or
       // should surface the failure to the user.
-      isConnectedRef.current = false;
-      setBleUp(false);
-      isAuthedRef.current = false;
+      // Only wipe the shared refs if this attempt still owns the session —
+      // a superseded attempt's 8s auth timer lands here AFTER a replacement
+      // has fully connected, and wiping its refs left a zombie UI.
+      if (connectGenRef.current === myGen) {
+        isConnectedRef.current = false;
+        setBleUp(false);
+        isAuthedRef.current = false;
+        deviceRef.current = null;
+        setDeviceLabel(null);
+      }
       try { await connected.cancelConnection(); } catch {}
-      deviceRef.current = null;
-      setDeviceLabel(null);
       throw err;
+    }
+
+    if (connectGenRef.current !== myGen) {
+      // Superseded while the handshake was in flight (disconnect or a newer
+      // attempt bumped the generation just as the auth ack landed) — this
+      // link is no longer the session's. Release it and back out.
+      try { await connected.cancelConnection(); } catch {}
+      throw new Error('Connection attempt superseded.');
     }
 
     isAuthedRef.current = true;
@@ -1408,6 +1467,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   // isn't the device this record points at, repair the caches and bail to
   // BLE, which matches by advertised name and cannot mis-target.
   const connectHttp = useCallback(async (ip: string, expectedMac?: string): Promise<boolean> => {
+    let mine: { ip: string; token: string; nonce: string } | null = null;
     try {
       const { token, mac, nonce } = await httpAuthenticate(ip);
       // A retry/promote tick that was already in flight when the user
@@ -1425,7 +1485,8 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         await upsertDevice({ mac: expectedMac, lastIp: null }); // stop retrying the stale address
         return false;
       }
-      httpRef.current = { ip, token, nonce };
+      mine = { ip, token, nonce };
+      httpRef.current = mine;
 
       const state = await httpGetState(ip, token);
       applyRemoteState(state);
@@ -1442,7 +1503,11 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       startHttpPolling();
       return true;
     } catch {
-      httpRef.current = null;
+      // Only tear down what THIS attempt installed: overlapping attempts
+      // (the promote tick and the wifi-online effect both run this) meant
+      // a late failure here could null a live transport a concurrent
+      // attempt had just established — leaving polling wedged on !http.
+      if (mine && httpRef.current === mine) httpRef.current = null;
       return false;
     }
   }, [applyRemoteState, startHttpPolling, setTransportBoth, upsertDevice]);
@@ -1496,7 +1561,10 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const hasPermission = await requestBlePermissions();
+    // The catch matters: a throw here (requestMultiple can reject) would
+    // leave connectInFlightRef stuck true, silently eating every later
+    // connect attempt until the user taps Disconnect.
+    const hasPermission = await requestBlePermissions().catch(() => false);
     if (!hasPermission) {
       fail('Bluetooth permission was denied. Enable it in Settings.');
       return;
@@ -1683,11 +1751,21 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   // ============================================================
   //  WI-FI PROVISIONING  (BLE only — see the firmware's reasoning)
   // ============================================================
+  // The BLE scan path's spinner-clear timer, tracked so a rescan cancels
+  // the previous scan's timer instead of inheriting its 20s deadline.
+  const wifiScanTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const scanWifiNetworks = useCallback(async () => {
     const device = deviceRef.current;
     const http = httpRef.current;
     setWifiNetworks([]);
     setWifiScanning(true);
+    // Cancel the previous scan's spinner-clear timer: left running, it
+    // killed a rescan's spinner at its own 20s mark with results pending.
+    if (wifiScanTimeoutRef.current) {
+      clearTimeout(wifiScanTimeoutRef.current);
+      wifiScanTimeoutRef.current = null;
+    }
 
     // The device caches its latest scan at /wifiScan — polled as the
     // result channel over HTTP, and as the safety net for the BLE push
@@ -1722,7 +1800,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       // Results arrive as a wifiScan push; the HTTP poll (when available)
       // covers a torn push. Clear the spinner if nothing ever lands.
       if (http) pollResults(http);
-      setTimeout(() => setWifiScanning(false), 20000);
+      wifiScanTimeoutRef.current = setTimeout(() => setWifiScanning(false), 20000);
       return;
     }
 
@@ -1768,10 +1846,15 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     const http = httpRef.current;
     if (http) {
       try {
-        await httpSendCommand(http.ip, http.token, {
+        // Re-authenticate first: the firmware keeps a single HTTP nonce, so
+        // any /challenge since ours (another phone, our own OTA flow) has
+        // rotated it and the password would decrypt to garbage.
+        const fresh = await httpAuthenticate(http.ip);
+        httpRef.current = { ip: http.ip, token: fresh.token, nonce: fresh.nonce };
+        await httpSendCommand(http.ip, fresh.token, {
           cmd: 'setWifi',
           ssid,
-          passEnc: keystreamEncryptHex(http.nonce, password),
+          passEnc: keystreamEncryptHex(fresh.nonce, password),
           tzOffsetSec: -new Date().getTimezoneOffset() * 60,
         });
         setWifi({ state: 'connecting', ssid });
@@ -1814,7 +1897,11 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       if (statusRef.current === 'connected') {
-        const deaf = lastRxAtRef.current === 0 || Date.now() - lastRxAtRef.current > 8000;
+        // Deafness is a BLE-notify concept: on a Wi-Fi-only session lastRxAt
+        // never ticks, so without this gate a healthy HTTP transport would
+        // always read as deaf and get torn down mid-join.
+        const bleLinkUp = deviceRef.current != null && isAuthedRef.current;
+        const deaf = bleLinkUp && (lastRxAtRef.current === 0 || Date.now() - lastRxAtRef.current > 8000);
         if (!deaf) { refreshState(); return; }
         console.warn('[ble] link is deaf — reconnecting');
         await disconnect({ keepWifiUi: true });
@@ -1849,7 +1936,19 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     }
     stopHttpPolling();
     httpRef.current = null;
-    if (transportRef.current === 'wifi') setTransportBoth(isAuthedRef.current ? 'ble' : null);
+    if (transportRef.current === 'wifi') {
+      if (isAuthedRef.current) {
+        setTransportBoth('ble');
+      } else {
+        // That was the only transport: reflect a real disconnect, or the UI
+        // stays "Wi-Fi Connected" forever with every command silently
+        // dropped and the reconnect loop (gated on disconnected/error)
+        // never engaging.
+        setTransportBoth(null);
+        setStatus('disconnected');
+        setDeviceLabel(null);
+      }
+    }
     // Reflect it immediately rather than waiting for the device's push —
     // the firmware's announce/state broadcast then confirms it. Without
     // this the UI kept showing the old network even though the device had
@@ -1924,17 +2023,23 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     // version answers — the proof the update actually took.
     onPhase('Device is rebooting…', 1);
     const deadline = Date.now() + 90000;
+    let lastFw: string | null = null;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 3000));
       try {
         const res = await httpFetch(ip, '/ping');
         const json = await res.json();
         if (json?.fw === targetVersion) return;
-        if (typeof json?.fw === 'string') throw new Error(`Device came back reporting ${json.fw} — the update did not stick.`);
-      } catch (err: any) {
-        if (err?.message?.includes('did not stick')) throw err;
+        // The OLD firmware can legitimately answer here — it flushes the
+        // /update response before its scheduled reboot fires. Not a verdict
+        // yet: remember it, keep polling, and only conclude at the deadline.
+        if (typeof json?.fw === 'string') lastFw = json.fw;
+      } catch {
         // still rebooting — keep polling
       }
+    }
+    if (lastFw && lastFw !== targetVersion) {
+      throw new Error(`Device came back reporting ${lastFw} — the update did not stick.`);
     }
     throw new Error('Device did not come back within 90s. Power-cycle it and check the firmware version — the previous firmware still boots if the update failed.');
   }, [wifi?.ip]);
@@ -2155,18 +2260,25 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       speedRpm: input.speedRpm,
       pumpType: input.pumpType,
     } : p)));
+    // A just-added row still carries its optimistic "local-…" id until the
+    // next state push delivers the real "p<n>" — the firmware can only
+    // reject that id, and the doomed command's revert made the UI flicker.
+    // Ask for fresh state instead so the id resolves quickly.
+    if (id.startsWith('local-')) { refreshState().catch(() => {}); return; }
     sendCommand({ cmd: 'updateSchedule', id, schedule: input });
-  }, [sendCommand]);
+  }, [sendCommand, refreshState]);
 
   const deleteScheduleFn = useCallback((id: string) => {
     setPresets((ps) => ps.filter((p) => p.id !== id));
+    if (id.startsWith('local-')) { refreshState().catch(() => {}); return; }
     sendCommand({ cmd: 'deleteSchedule', id });
-  }, [sendCommand]);
+  }, [sendCommand, refreshState]);
 
   const toggleScheduleFn = useCallback((id: string, enabled: boolean) => {
     setPresets((ps) => ps.map((p) => (p.id === id ? { ...p, enabled } : p)));
+    if (id.startsWith('local-')) { refreshState().catch(() => {}); return; }
     sendCommand({ cmd: 'toggleSchedule', id, enabled });
-  }, [sendCommand]);
+  }, [sendCommand, refreshState]);
 
   const setRelay2DependencyFn = useCallback((depends: boolean) => {
     setR2Depends(depends); // optimistic; the next state push confirms
@@ -3593,9 +3705,12 @@ function DeviceScreen({ onPairingComplete }: { onPairingComplete?: () => void })
   // removed deliberately: picking a peripheral off a raw scan list is exactly
   // the manual, out-of-app connection path this build is meant to close off.
   // Pairing now goes through the QR code only.
-  useEffect(() => {
-    return () => { _bleManager?.stopDeviceScan(); };
-  }, []);
+  //
+  // No stopDeviceScan cleanup on unmount: this screen unmounts on every tab
+  // switch, and the scan belongs to the provider's connect flow — killing it
+  // here aborted in-flight connects ("couldn't find nearby" for a device
+  // that was advertising). The connect flow's own 12s timeout and
+  // disconnect() handle scanner cleanup.
 
   // One Wi-Fi prompt per connection. Without this flag the effect below
   // would reopen the picker on every 5s state push after the user skipped.
