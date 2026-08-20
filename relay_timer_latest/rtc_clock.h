@@ -36,6 +36,11 @@
 
 RTC_DS3231 rtc;
 bool rtcAvailable = false;
+// False while the DS3231 holds the fabricated 12:00 seed (battery was
+// dead/missing at boot). Resyncs must not promote that seed to a trusted
+// wall clock — schedules are gated on clockWasSet(). Becomes true once a
+// real time lands: battery-backed value at boot, or a user/app set.
+bool rtcTimeTrusted = false;
 
 #define RTC_RESYNC_INTERVAL_MS (30UL * 60UL * 1000UL) // 30 minutes
 
@@ -58,12 +63,13 @@ inline void rtcBegin() {
   }
 
   if (rtc.lostPower()) {
-    Serial.println("DS3231 lost power (empty/new module) - seeding default 12:00:00");
+    Serial.println("DS3231 lost power (empty/new module) - seeding default 12:00:00 (untrusted; schedules wait for a real time)");
     rtcWriteTime(12, 0, 0);
-    clockSetFromRTC(12, 0, 0);
+    clockSeedUntrusted(12, 0, 0); // display runs, but this must not fire schedules
   } else {
     DateTime now = rtc.now();
     Serial.println("DS3231 OK - time loaded from RTC");
+    rtcTimeTrusted = true;
     clockSetFromRTC(now.hour(), now.minute(), now.second());
   }
 }
@@ -72,7 +78,7 @@ inline void rtcBegin() {
 // loop() tick -- it only actually touches I2C once it's due.
 inline void rtcResync() {
   static unsigned long lastResyncMs = 0;
-  if (!rtcAvailable) return;
+  if (!rtcAvailable || !rtcTimeTrusted) return; // never resync FROM the untrusted seed
   if (millis() - lastResyncMs < RTC_RESYNC_INTERVAL_MS) return;
   lastResyncMs = millis();
   DateTime now = rtc.now();
@@ -102,4 +108,5 @@ inline void rtcServicePendingWrite() {
   if (!rtcPendingWrite) return;
   rtcPendingWrite = false;
   rtcWriteTime(rtcPendingH, rtcPendingM, 0);
+  rtcTimeTrusted = true; // a user/app-set time replaces the untrusted seed
 }

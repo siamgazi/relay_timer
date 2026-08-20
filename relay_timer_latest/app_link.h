@@ -185,6 +185,8 @@ struct AppSession {
   uint16_t connHandle;
   bool     authed;
   bool     dropPending; // loop() asked for a disconnect; free happens in onDisconnect
+  bool     txPoisoned;  // last chunked send was abandoned mid-message — the
+                        // phone's reassembly buffer holds a partial line
   char     nonceHex[33]; // kept after auth — the setWifi keystream derives from it
   bool     nonceIssued;
   uint32_t connectedAtMs;
@@ -445,6 +447,7 @@ inline String appBuildStateJson() {
     else if (i == 3) strlcpy(cdBuf, "Independent", sizeof(cdBuf));
     else             appCountdownText(TGT_RELAY1 + i - 1, cdBuf, sizeof(cdBuf));
     r["countdown"] = cdBuf;
+    r["freeze"] = relayFreezeGet(i);
   }
 
   JsonArray pumpArr = doc.createNestedArray("pumps");
@@ -458,6 +461,7 @@ inline String appBuildStateJson() {
     pumpActualStateGet(i, pActive, pSpeed);
     p["active"] = pActive;
     p["speedRpm"] = pSpeed;
+    p["watts"] = pumpActualWattsGet(i); // 0 = unknown; B&D never reports
     uint16_t ms; uint8_t mt; pumpManualParamsGet(i, ms, mt);
     p["pumpType"] = appPumpTypeStr(mt);
     // Configured manual set-point, distinct from speedRpm above (the
@@ -467,6 +471,20 @@ inline String appBuildStateJson() {
     p["setSpeedRpm"] = ms;
     appCountdownText(TGT_PUMP1 + i - 1, cdBuf, sizeof(cdBuf));
     p["countdown"] = cdBuf;
+    bool fEn; uint16_t fSpd; pumpFreezeGet(i, fEn, fSpd);
+    p["freeze"] = fEn;
+    p["freezeSpeed"] = fSpd;
+  }
+
+  // Freeze protection status: threshold, latest reading, engaged flag.
+  {
+    JsonObject frz = doc.createNestedObject("freeze");
+    bool fa, fok; float ft;
+    freezeStatusGet(fa, ft, fok);
+    frz["tempF"] = freezeTempFGet();
+    frz["active"] = fa;
+    frz["sensorOk"] = fok;
+    if (fok) frz["currentF"] = ((int)(ft * 10 + (ft >= 0 ? 0.5f : -0.5f))) / 10.0f;
   }
 
   // Presets <-> the app's "schedules". The id is the slot index ("p0".."p7"),
@@ -695,6 +713,47 @@ inline String appExecuteCommand(JsonDocument& doc, bool& changed) {
     return appBuildAck(cmd, true);
   }
 
+  if (strcmp(cmd, "setRelayFreeze") == 0) {
+    int id = doc["id"] | -1;
+    bool en = doc["enabled"] | false;
+    if (id < 1 || id > MAX_RELAYS) return appBuildAck(cmd, false, "no such relay");
+    // MAIN PUMP auto-enables on naming (relayNameIndexSet), but the user
+    // may still turn it off deliberately — no lock here.
+    relayFreezeSet(id, en);
+    Serial.printf("[cmd] relay %d freeze protection -> %s\n", id, en ? "on" : "off");
+    changed = true;
+    return appBuildAck(cmd, true);
+  }
+
+  if (strcmp(cmd, "setPumpFreeze") == 0) {
+    int id = doc["id"] | -1;
+    bool en = doc["enabled"] | false;
+    if (id < 1 || id > MAX_PUMPS) return appBuildAck(cmd, false, "no such pump");
+    // MAIN PUMP auto-enables on naming (pumpNameIndexSet), but the user
+    // may still turn it off deliberately — no lock here.
+    uint16_t speed = doc["speedRpm"] | 0;
+    if (en) {
+      if (speed == 0) { bool e0; uint16_t s0; pumpFreezeGet(id, e0, s0); speed = s0; }
+      uint16_t ms; uint8_t mt; pumpManualParamsGet(id, ms, mt);
+      // Freeze speed must be drivable with the pump's configured protocol.
+      if (!appSpeedValidFor(mt, speed))
+        return appBuildAck(cmd, false, appSpeedRangeMsg(mt));
+    }
+    pumpFreezeSet(id, en, speed);
+    Serial.printf("[cmd] pump %d freeze protection -> %s @ %u rpm\n", id, en ? "on" : "off", speed);
+    changed = true;
+    return appBuildAck(cmd, true);
+  }
+
+  if (strcmp(cmd, "setFreezeTemp") == 0) {
+    int t = doc["tempF"] | -1000;
+    if (t < 20 || t > 60) return appBuildAck(cmd, false, "freeze temperature must be 20-60 F");
+    freezeTempFSet((int16_t)t);
+    Serial.printf("[cmd] freeze temperature -> %dF\n", t);
+    changed = true;
+    return appBuildAck(cmd, true);
+  }
+
   return appBuildAck(cmd, false, "unrecognized command");
 }
 
@@ -711,6 +770,10 @@ inline bool appSendChunkedTo(AppSession* s, const String& payload) {
     return false;
   }
   String withDelim = payload + "\n";
+  // A previously abandoned message left a partial line in the phone's
+  // buffer; without this flush the partial glues onto THIS message's first
+  // line and both fail to parse — one tear then eats every following push.
+  if (s->txPoisoned) withDelim = "\n" + withDelim;
   size_t chunkSize = (s->mtu > 3) ? (s->mtu - 3) : 20;
   size_t len = withDelim.length();
   bool ok = true;
@@ -729,6 +792,7 @@ inline bool appSendChunkedTo(AppSession* s, const String& payload) {
     if (ok) delay(10);
   }
   if (appTxMutex) xSemaphoreGive(appTxMutex);
+  s->txPoisoned = !ok; // fully delivered clears it; abandoned re-arms it
   return ok;
 }
 
@@ -777,13 +841,14 @@ inline void appBroadcastWifiEvent() {
 // Returns true only when the event reached every authed BLE session (or
 // none exists to tell) — the caller keeps the change queued and retries
 // on false, because a dropped notify must not swallow a confirmation.
-inline bool appBroadcastPumpEvent(uint8_t pumpId, bool active, uint16_t speed) {
+inline bool appBroadcastPumpEvent(uint8_t pumpId, bool active, uint16_t speed, uint16_t watts) {
   StaticJsonDocument<192> doc;
   doc["type"] = "pump";
   doc["mac"] = appDeviceMac;
   doc["id"] = pumpId;
   doc["active"] = active;
   doc["speedRpm"] = speed;
+  doc["watts"] = watts;
   // Name rides along so a rename reaches BLE phones even when the big
   // state push is torn by radio contention.
   char nameBuf[16];
@@ -1582,27 +1647,31 @@ inline void appLinkLoop() {
   {
     static bool     lastPumpActive[MAX_PUMPS];
     static uint16_t lastPumpSpeed[MAX_PUMPS];
+    static uint16_t lastPumpWatts[MAX_PUMPS];
     static int8_t   lastPumpName[MAX_PUMPS];
     static unsigned long pumpRetryAtMs[MAX_PUMPS] = {0, 0, 0, 0};
     static bool     pumpSnapInit = false;
     for (int i = 1; i <= MAX_PUMPS; i++) {
       bool a; uint16_t sp;
       pumpActualStateGet(i, a, sp);
+      uint16_t w = pumpActualWattsGet(i);
       int8_t nameIdx = pumpNameIndexGet(i);
       if (!pumpSnapInit) {
         lastPumpActive[i - 1] = a;
         lastPumpSpeed[i - 1] = sp;
+        lastPumpWatts[i - 1] = w;
         lastPumpName[i - 1] = nameIdx;
         continue;
       }
       bool changed = (a != lastPumpActive[i - 1] || sp != lastPumpSpeed[i - 1] ||
-                      nameIdx != lastPumpName[i - 1]);
+                      w != lastPumpWatts[i - 1] || nameIdx != lastPumpName[i - 1]);
       if (!changed) continue;
       if (nowMs < pumpRetryAtMs[i - 1]) continue; // last notify dropped — brief backoff
-      if (appBroadcastPumpEvent(i, a, sp)) {
+      if (appBroadcastPumpEvent(i, a, sp, w)) {
         // Consumed only on successful delivery to every authed session.
         lastPumpActive[i - 1] = a;
         lastPumpSpeed[i - 1] = sp;
+        lastPumpWatts[i - 1] = w;
         lastPumpName[i - 1] = nameIdx;
         pumpRetryAtMs[i - 1] = 0;
       } else {

@@ -89,6 +89,20 @@ namespace _state {
   // run on the BLE and HTTP tasks too, and the single Preferences object
   // must never be driven from two tasks at once.
   volatile bool pendingPresetSave = false;
+
+  // --- Freeze protection ---------------------------------------------
+  // Per-channel opt-in flags + per-pump freeze speed, all persisted.
+  // freezeTempF is the trigger threshold (°F); protection engages after
+  // the thermistor reads <= threshold for 30s straight and releases at
+  // threshold + 2°F. Live status lives in RAM only.
+  bool     relayFreeze[MAX_RELAYS] = {false, false, false};
+  bool     pumpFreeze[MAX_PUMPS]   = {false, false, false, false};
+  uint16_t pumpFreezeSpeed[MAX_PUMPS] = {0, 0, 0, 0};
+  int16_t  freezeTempF = 34;
+  volatile bool pendingFreezeSave = false;
+  bool     freezeActive = false;   // protection currently engaged
+  bool     tempSensorOk = false;   // reading is in a plausible range
+  float    curTempF = 0.0f;        // latest reading (valid when tempSensorOk)
 }
 
 // 1. Put markDirty back on the list so everyone can use it
@@ -124,7 +138,26 @@ inline void loadPresetsFromFlash() {
   } else {
     for (int i = 0; i < MAX_RELAYS; i++) relayNameIndex[i] = -1;
   }
+  if (prefs.getBytesLength("rlyFrz") == sizeof(relayFreeze))
+    prefs.getBytes("rlyFrz", relayFreeze, sizeof(relayFreeze));
+  if (prefs.getBytesLength("pmpFrz") == sizeof(pumpFreeze))
+    prefs.getBytes("pmpFrz", pumpFreeze, sizeof(pumpFreeze));
+  if (prefs.getBytesLength("pmpFrzSp") == sizeof(pumpFreezeSpeed))
+    prefs.getBytes("pmpFrzSp", pumpFreezeSpeed, sizeof(pumpFreezeSpeed));
+  freezeTempF = prefs.getShort("frzTempF", 34);
   prefs.end();
+
+  // Boot inventory: makes "settings are gone" diagnosable. All-default
+  // names + 0 presets right after a USB flash means NVS was erased
+  // (Erase All Flash / changed partition scheme) — not a sync bug.
+  int usedP = 0, namedPumps = 0, namedRelays = 0, frzFlags = 0;
+  for (int i = 0; i < MAX_PRESETS; i++) if (presets[i].used) usedP++;
+  for (int i = 0; i < MAX_PUMPS; i++) if (pumpNameIndex[i] >= 0) namedPumps++;
+  for (int i = 0; i < MAX_RELAYS; i++) if (relayNameIndex[i] >= 0) namedRelays++;
+  for (int i = 0; i < MAX_PUMPS; i++) if (pumpFreeze[i]) frzFlags++;
+  for (int i = 0; i < MAX_RELAYS; i++) if (relayFreeze[i]) frzFlags++;
+  Serial.printf("[nvs] loaded: %d presets, %d pump names, %d relay names, %d freeze flags, freeze temp %dF\n",
+                usedP, namedPumps, namedRelays, frzFlags, (int)freezeTempF);
 }
 
 inline void relay2DependencySet(bool depends) {
@@ -150,9 +183,20 @@ inline void processPendingSaves() {
   int8_t relayNameSnapshot[MAX_RELAYS];
   bool doPresetSave = false;
   static Preset presetSnapshot[MAX_PRESETS]; // loop()-only; too big for the stack
+  bool doFreezeSave = false;
+  bool rlyFrzSnap[MAX_RELAYS]; bool pmpFrzSnap[MAX_PUMPS];
+  uint16_t pmpFrzSpSnap[MAX_PUMPS]; int16_t frzTempSnap = 34;
 
   {
     StateLock lock;
+    if (_state::pendingFreezeSave) {
+      doFreezeSave = true;
+      memcpy(rlyFrzSnap, _state::relayFreeze, sizeof(rlyFrzSnap));
+      memcpy(pmpFrzSnap, _state::pumpFreeze, sizeof(pmpFrzSnap));
+      memcpy(pmpFrzSpSnap, _state::pumpFreezeSpeed, sizeof(pmpFrzSpSnap));
+      frzTempSnap = _state::freezeTempF;
+      _state::pendingFreezeSave = false;
+    }
     if (_state::pendingDepSave) {
       doSave = true;
       valToSave = _state::relay2DependsOn1;
@@ -193,6 +237,14 @@ inline void processPendingSaves() {
   if (doPresetSave) {
     _state::prefs.begin("relaytimer", false);
     _state::prefs.putBytes("presets", presetSnapshot, sizeof(presetSnapshot));
+    _state::prefs.end();
+  }
+  if (doFreezeSave) {
+    _state::prefs.begin("relaytimer", false);
+    _state::prefs.putBytes("rlyFrz", rlyFrzSnap, sizeof(rlyFrzSnap));
+    _state::prefs.putBytes("pmpFrz", pmpFrzSnap, sizeof(pmpFrzSnap));
+    _state::prefs.putBytes("pmpFrzSp", pmpFrzSpSnap, sizeof(pmpFrzSpSnap));
+    _state::prefs.putShort("frzTempF", frzTempSnap);
     _state::prefs.end();
   }
 }
@@ -347,6 +399,22 @@ inline void clockSetFromRTC(uint8_t h, uint8_t m, uint8_t s) {
   markDirty();
 }
 
+// Seeds the display clock WITHOUT marking time as set — for the fabricated
+// 12:00 a dead-battery RTC gets at boot. Schedules are gated on
+// clockWasSet(), so a made-up wall clock must never count as a time source.
+inline void clockSeedUntrusted(uint8_t h, uint8_t m, uint8_t s) {
+  {
+    StateLock lock;
+    _state::curHour = h;
+    _state::curMinute = m;
+    _state::curSecond = s;
+    _state::timeWasSet = false;
+    _state::timeSource_NTP = false;
+    _state::timeSource_RTC = false;
+  }
+  markDirty();
+}
+
 // Called once per second from loop() to advance the software clock.
 inline void clockTickOneSecond() {
   StateLock lock;
@@ -486,6 +554,14 @@ inline bool pumpNameIndexSet(int pumpNum, int8_t nameIdx) {
     if (ok) {
       _state::pumpNameIndex[pumpNum - 1] = nameIdx;
       _state::pendingPumpNameSave = true;
+      // MAIN PUMP is always freeze protected: naming a pump MAIN PUMP
+      // (index 0) enables its freeze flag, with a sane default speed.
+      if (nameIdx == 0 && !_state::pumpFreeze[pumpNum - 1]) {
+        _state::pumpFreeze[pumpNum - 1] = true;
+        if (_state::pumpFreezeSpeed[pumpNum - 1] == 0)
+          _state::pumpFreezeSpeed[pumpNum - 1] = 1200;
+        _state::pendingFreezeSave = true;
+      }
     }
   }
   if (ok) markDirty();
@@ -525,6 +601,12 @@ inline bool relayNameIndexSet(int relayNum, int8_t nameIdx) {
     if (ok) {
       _state::relayNameIndex[relayNum - 1] = nameIdx;
       _state::pendingRelayNameSave = true;
+      // MAIN PUMP is always freeze protected — same rule when the name
+      // lands on a relay (e.g. one driving the main pump's contactor).
+      if (nameIdx == 0 && !_state::relayFreeze[relayNum - 1]) {
+        _state::relayFreeze[relayNum - 1] = true;
+        _state::pendingFreezeSave = true;
+      }
     }
   }
   if (ok) markDirty();
@@ -542,6 +624,73 @@ inline void relayDisplayName(int relayNum, char *out, size_t outLen) {
   } else {
     snprintf(out, outLen, "Relay %d", relayNum);
   }
+}
+
+// ============================================================
+//  FREEZE PROTECTION ACCESSORS
+// ============================================================
+inline bool relayFreezeGet(int relayNum) {
+  if (relayNum < 1 || relayNum > MAX_RELAYS) return false;
+  StateLock lock;
+  return _state::relayFreeze[relayNum - 1];
+}
+inline void relayFreezeSet(int relayNum, bool en) {
+  if (relayNum < 1 || relayNum > MAX_RELAYS) return;
+  {
+    StateLock lock;
+    _state::relayFreeze[relayNum - 1] = en;
+    _state::pendingFreezeSave = true;
+  }
+  markDirty();
+}
+inline void pumpFreezeGet(int pumpNum, bool &en, uint16_t &speed) {
+  en = false; speed = 0;
+  if (pumpNum < 1 || pumpNum > MAX_PUMPS) return;
+  StateLock lock;
+  en = _state::pumpFreeze[pumpNum - 1];
+  speed = _state::pumpFreezeSpeed[pumpNum - 1];
+}
+inline void pumpFreezeSet(int pumpNum, bool en, uint16_t speed) {
+  if (pumpNum < 1 || pumpNum > MAX_PUMPS) return;
+  {
+    StateLock lock;
+    _state::pumpFreeze[pumpNum - 1] = en;
+    if (en && speed > 0) _state::pumpFreezeSpeed[pumpNum - 1] = speed;
+    _state::pendingFreezeSave = true;
+  }
+  markDirty();
+}
+inline int16_t freezeTempFGet() {
+  StateLock lock;
+  return _state::freezeTempF;
+}
+inline void freezeTempFSet(int16_t t) {
+  {
+    StateLock lock;
+    _state::freezeTempF = t;
+    _state::pendingFreezeSave = true;
+  }
+  markDirty();
+}
+inline void freezeStatusGet(bool &active, float &tempF, bool &sensorOk) {
+  StateLock lock;
+  active = _state::freezeActive;
+  tempF = _state::curTempF;
+  sensorOk = _state::tempSensorOk;
+}
+// Loop-only publisher. Bumps the state version only when active/sensorOk
+// FLIP — the per-second temperature sample must not trigger a state push
+// every second (the 5s heartbeat carries the latest reading regardless).
+inline void freezeStatusSet(bool active, float tempF, bool sensorOk) {
+  bool changed;
+  {
+    StateLock lock;
+    changed = (_state::freezeActive != active) || (_state::tempSensorOk != sensorOk);
+    _state::freezeActive = active;
+    _state::curTempF = tempF;
+    _state::tempSensorOk = sensorOk;
+  }
+  if (changed) markDirty();
 }
 
 // Unified display name for a preset's target (0-2 = relays, 3-6 = pumps),

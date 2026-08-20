@@ -162,6 +162,7 @@ interface RelayState {
   mode: RelayMode;
   active: boolean;
   countdown: string;
+  freeze: boolean; // freeze protection opt-in — forced on while a freeze event runs
 }
 
 interface PumpState {
@@ -171,8 +172,19 @@ interface PumpState {
   active: boolean;
   speedRpm: number;    // CONFIRMED speed — 0 until the pump acknowledges over RS-485
   setSpeedRpm: number; // configured manual set-point — what the speed input shows
+  watts: number | null; // live power readback — null when not reported (B&D never reports, older firmware)
   pumpType: PumpType;
   countdown: string;
+  freeze: boolean;      // freeze protection opt-in
+  freezeSpeed: number;  // RPM the pump runs at during a freeze event
+}
+
+// Freeze protection status pushed by the device.
+interface FreezeInfo {
+  tempF: number;          // trigger threshold (°F)
+  currentF: number | null; // latest reading — null when the sensor faults
+  active: boolean;        // protection currently engaged
+  sensorOk: boolean;
 }
 
 interface Preset {
@@ -228,6 +240,7 @@ const initialRelays: RelayState[] = [1, 2, 3].map((id) => ({
   mode: 'auto',
   active: false,
   countdown: id === 2 ? 'Depends on Relay 1' : id === 3 ? 'Independent' : 'No active schedule',
+  freeze: false,
 }));
 
 const initialPumps: PumpState[] = [1, 2, 3, 4].map((i) => ({
@@ -237,8 +250,11 @@ const initialPumps: PumpState[] = [1, 2, 3, 4].map((i) => ({
   active: false,
   speedRpm: 0,
   setSpeedRpm: 0,
+  watts: null,
   pumpType: 'Pentair',
   countdown: 'No active schedule',
+  freeze: false,
+  freezeSpeed: 0,
 }));
 
 const initialPresets: Preset[] = [
@@ -315,8 +331,7 @@ function utf8Bytes(str: string): number[] {
   return bytes;
 }
 
-function utf8ToBase64(str: string): string {
-  const bytes = utf8Bytes(str);
+function bytesToBase64(bytes: number[]): string {
   let out = '';
   for (let i = 0; i < bytes.length; i += 3) {
     const b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
@@ -674,6 +689,12 @@ function formatDurationStr(durationMin: number): string {
   const m = durationMin % 60;
   return `${h}h ${m.toString().padStart(2, '0')}m`;
 }
+// The firmware stores start + duration; the UI shows start + stop. This
+// derives the stop time (wrapping past midnight) for display and editing.
+function stopTimeOf(hour24: number, minute: number, durationMin: number): { hour24: number; minute: number } {
+  const stop = (hour24 * 60 + minute + durationMin) % 1440;
+  return { hour24: Math.floor(stop / 60), minute: stop % 60 };
+}
 
 // ============================================================
 //  POOL CONTEXT  — BLE connection + shared relay/pump/preset state
@@ -726,6 +747,12 @@ interface PoolContextValue {
   // Relay 2's dependency on Relay 1 — the switch the web UI had.
   r2Depends: boolean;
   setRelay2Dependency: (depends: boolean) => void;
+
+  // Freeze protection
+  freezeInfo: FreezeInfo | null;
+  setRelayFreeze: (id: number, enabled: boolean) => void;
+  setPumpFreeze: (id: number, enabled: boolean, speedRpm: number) => void;
+  setFreezeTemp: (tempF: number) => void;
 }
 
 const PoolContext = createContext<PoolContextValue | null>(null);
@@ -773,6 +800,30 @@ async function requestBlePermissions(): Promise<boolean> {
   return true; // iOS handled via Info.plist + native prompt
 }
 
+// Schedule and rename commands are fired from the Home tab, but rejections
+// only land in lastError — which renders on the Device tab. Surface them
+// where the action happened, or the optimistic change just silently
+// reverts on the next state push.
+const ALERT_CMDS: Record<string, string> = {
+  addSchedule: 'Schedule', updateSchedule: 'Schedule',
+  deleteSchedule: 'Schedule', toggleSchedule: 'Schedule',
+  setRelayName: 'Rename', setPumpConfig: 'Pump settings',
+  setRelayFreeze: 'Freeze protection', setPumpFreeze: 'Freeze protection',
+  setFreezeTemp: 'Freeze temperature',
+};
+function surfaceAckError(cmd: unknown, message: unknown) {
+  const title = typeof cmd === 'string' ? ALERT_CMDS[cmd] : undefined;
+  if (title) {
+    let text = typeof message === 'string' && message ? message : 'The device rejected the change.';
+    // "unrecognized command" is firmware-speak for "this controller's
+    // firmware predates the feature" — say that instead.
+    if (text === 'unrecognized command') {
+      text = "This controller's firmware doesn't support this yet. Update it from Settings → Firmware update.";
+    }
+    Alert.alert(title, text);
+  }
+}
+
 function waitForPoweredOn(manager: BleManager): Promise<boolean> {
   return new Promise((resolve) => {
     manager.state().then((state) => {
@@ -795,6 +846,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   const [pumps, setPumps] = useState<PumpState[]>(initialPumps);
   const [presets, setPresets] = useState<Preset[]>(initialPresets);
   const [r2Depends, setR2Depends] = useState(true); // matches the firmware default
+  const [freezeInfo, setFreezeInfo] = useState<FreezeInfo | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [deviceLabel, setDeviceLabel] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -894,8 +946,20 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     return merged;
   }, []);
 
+  // Stamp of the last full state frame that made it through — the BLE
+  // connect flow verifies one actually landed (big chunked pushes tear).
+  const lastStateAtRef = useRef(0);
+
+  // Pending optimistic freeze changes, keyed "r1"/"p2". A state frame built
+  // BEFORE the command applied must not flip a just-toggled switch back
+  // (the visible on→off→on flicker): while a change is pending, contradicting
+  // frames keep the optimistic value until the device confirms it — or until
+  // a 5s timeout, so a genuinely rejected command still settles to truth.
+  const pendingFreezeRef = useRef<Map<string, { value: boolean; speed?: number; at: number }>>(new Map());
+
   // ---- apply a full state push from the ESP32 into React state ----
   const applyRemoteState = useCallback((msg: any) => {
+    lastStateAtRef.current = Date.now();
     // Identity + transport info. Caching the IP here on every state push
     // is what makes a DHCP-reassigned address self-heal: the next BLE
     // connection silently refreshes it.
@@ -927,7 +991,23 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         prev.map((r) => {
           const found = msg.relays.find((x: any) => x.id === r.id);
           if (!found) return r;
-          return { ...r, name: found.name, mode: found.mode, active: found.active, countdown: found.countdown };
+          let freeze = found.freeze === true;
+          const pend = pendingFreezeRef.current.get(`r${r.id}`);
+          if (pend) {
+            if (freeze === pend.value || Date.now() - pend.at > 5000) {
+              pendingFreezeRef.current.delete(`r${r.id}`); // confirmed (or timed out)
+            } else {
+              freeze = pend.value; // stale frame from before the command applied
+            }
+          }
+          return {
+            ...r,
+            name: found.name,
+            mode: found.mode,
+            active: found.active,
+            countdown: found.countdown,
+            freeze,
+          };
         })
       );
     }
@@ -936,6 +1016,18 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         prev.map((p) => {
           const found = msg.pumps.find((x: any) => x.id === p.id);
           if (!found) return p;
+          let pFreeze = found.freeze === true;
+          let pFreezeSpeed = typeof found.freezeSpeed === 'number' ? found.freezeSpeed : p.freezeSpeed;
+          const pend = pendingFreezeRef.current.get(`p${p.id}`);
+          if (pend) {
+            const settled = pFreeze === pend.value && (pend.speed === undefined || pFreezeSpeed === pend.speed);
+            if (settled || Date.now() - pend.at > 5000) {
+              pendingFreezeRef.current.delete(`p${p.id}`);
+            } else {
+              pFreeze = pend.value;
+              if (pend.speed !== undefined) pFreezeSpeed = pend.speed;
+            }
+          }
           return {
             ...p,
             name: found.name,
@@ -944,8 +1036,12 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
             speedRpm: found.speedRpm,
             // Older firmware doesn't send the set-point — keep the local one.
             setSpeedRpm: typeof found.setSpeedRpm === 'number' ? found.setSpeedRpm : p.setSpeedRpm,
+            // 0 means "unknown" on the firmware side (B&D never reports) — show nothing.
+            watts: typeof found.watts === 'number' && found.watts > 0 ? found.watts : null,
             pumpType: found.pumpType,
             countdown: found.countdown,
+            freeze: pFreeze,
+            freezeSpeed: pFreezeSpeed,
           };
         })
       );
@@ -967,13 +1063,34 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
       );
     }
     if (typeof msg.r2Depends === 'boolean') setR2Depends(msg.r2Depends);
+    if (msg.freeze && typeof msg.freeze === 'object') {
+      setFreezeInfo({
+        tempF: typeof msg.freeze.tempF === 'number' ? msg.freeze.tempF : 34,
+        currentF: typeof msg.freeze.currentF === 'number' ? msg.freeze.currentF : null,
+        active: msg.freeze.active === true,
+        sensorOk: msg.freeze.sensorOk === true,
+      });
+    }
   }, [upsertDevice]);
 
   // Raw write — used by the handshake, which must be able to transmit
   // *before* isAuthedRef is set. Everything else goes through sendCommand.
+  //
+  // Chunked to the negotiated MTU: a single GATT write is capped at MTU-3
+  // bytes, and on Android an oversized write FAILS outright — so larger
+  // commands (schedules, Wi-Fi credentials) silently worked over Wi-Fi
+  // only. The firmware reassembles by newline, exactly like the app does
+  // for the firmware's chunked notifies, so parity is symmetrical.
   const writeLine = useCallback(async (device: Device, obj: object) => {
-    const b64 = utf8ToBase64(JSON.stringify(obj) + '\n');
-    await device.writeCharacteristicWithResponseForService(SERVICE_UUID, CHAR_RX_UUID, b64);
+    const bytes = utf8Bytes(JSON.stringify(obj) + '\n');
+    const mtu = typeof device.mtu === 'number' && device.mtu > 3 ? device.mtu : 23;
+    const chunkSize = mtu - 3;
+    for (let off = 0; off < bytes.length; off += chunkSize) {
+      const b64 = bytesToBase64(bytes.slice(off, off + chunkSize));
+      // With-response writes are acknowledged sequentially, so chunk order
+      // (and therefore reassembly) is guaranteed.
+      await device.writeCharacteristicWithResponseForService(SERVICE_UUID, CHAR_RX_UUID, b64);
+    }
   }, []);
 
   const handleIncomingLine = useCallback((line: string) => {
@@ -1102,6 +1219,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
                   ...p,
                   active: msg.active === true,
                   speedRpm: typeof msg.speedRpm === 'number' ? msg.speedRpm : p.speedRpm,
+                  watts: typeof msg.watts === 'number' ? (msg.watts > 0 ? msg.watts : null) : p.watts,
                   name: typeof msg.name === 'string' && msg.name ? msg.name : p.name,
                 }
               : p
@@ -1112,7 +1230,10 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (msg.type === 'state') applyRemoteState(msg);
-    else if (msg.type === 'ack' && msg.ok === false) setLastError(`${msg.cmd}: ${msg.message || 'failed'}`);
+    else if (msg.type === 'ack' && msg.ok === false) {
+      setLastError(`${msg.cmd}: ${msg.message || 'failed'}`);
+      surfaceAckError(msg.cmd, msg.message);
+    }
   }, [applyRemoteState, writeLine, upsertDevice]);
 
   // ---- send a command over whichever transport is currently active ----
@@ -1127,6 +1248,7 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
         const res = await httpSendCommand(http.ip, http.token, cmd);
         if (res?.type === 'ack' && res.ok === false) {
           setLastError(`${res.cmd}: ${res.message || 'failed'}`);
+          surfaceAckError(res.cmd, res.message);
         }
         return;
       } catch (err: any) {
@@ -1193,6 +1315,9 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     rxBufferRef.current = '';
     setStatus('disconnected');
     setDeviceLabel(null);
+    // Capability info is per-device: the next device may run older firmware,
+    // and stale freeze support would resurface controls it can't honor.
+    setFreezeInfo(null);
 
     // Clear per-device transient state, or the next pairing could act on
     // the PREVIOUS device's Wi-Fi status before the new one reports in.
@@ -1243,8 +1368,11 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
   const attachToDevice = useCallback(async (raw: Device, advertisedName: string) => {
     const myGen = connectGenRef.current;
 
-    const connected = await raw.discoverAllServicesAndCharacteristics();
-    try { await connected.requestMTU(517); } catch {}
+    let connected = await raw.discoverAllServicesAndCharacteristics();
+    // Capture the returned Device: it carries the NEGOTIATED mtu, which
+    // writeLine chunks against. Discarding it left .mtu at the default and
+    // silently under-used (or over-shot) the link.
+    try { connected = await connected.requestMTU(517); } catch {}
 
     deviceRef.current = connected;
     isConnectedRef.current = true;
@@ -1361,6 +1489,21 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     // The firmware pushes full state on a successful auth, but ask again
     // so a dropped notify can't leave us showing mock data.
     await writeLine(connected, { cmd: 'getState' });
+
+    // Both pushes above are big multi-chunk BLE messages that radio
+    // contention can tear. Over Wi-Fi the 2s poll self-heals; BLE-only has
+    // no fallback — so verify a state frame actually LANDED, and keep
+    // asking until one does. Without this, a torn connect-time push left
+    // default names and mock rows sitting in the UI.
+    const authedAt = Date.now();
+    (async () => {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await new Promise((r) => setTimeout(r, 2500));
+        if (connectGenRef.current !== myGen || !isAuthedRef.current) return;
+        if (lastStateAtRef.current > authedAt) return; // state arrived — done
+        await writeLine(connected, { cmd: 'getState' }).catch(() => {});
+      }
+    })();
   }, [handleIncomingLine, authenticate, writeLine, setTransportBoth]);
 
   // ============================================================
@@ -2285,6 +2428,23 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     sendCommand({ cmd: 'setRelay2Dependency', depends });
   }, [sendCommand]);
 
+  const setRelayFreezeFn = useCallback((id: number, enabled: boolean) => {
+    pendingFreezeRef.current.set(`r${id}`, { value: enabled, at: Date.now() });
+    setRelays((rs) => rs.map((r) => (r.id === id ? { ...r, freeze: enabled } : r)));
+    sendCommand({ cmd: 'setRelayFreeze', id, enabled });
+  }, [sendCommand]);
+
+  const setPumpFreezeFn = useCallback((id: number, enabled: boolean, speedRpm: number) => {
+    pendingFreezeRef.current.set(`p${id}`, { value: enabled, speed: enabled ? speedRpm : undefined, at: Date.now() });
+    setPumps((ps) => ps.map((p) => (p.id === id ? { ...p, freeze: enabled, freezeSpeed: enabled ? speedRpm : p.freezeSpeed } : p)));
+    sendCommand({ cmd: 'setPumpFreeze', id, enabled, speedRpm });
+  }, [sendCommand]);
+
+  const setFreezeTempFn = useCallback((tempF: number) => {
+    setFreezeInfo((f) => (f ? { ...f, tempF } : f)); // optimistic
+    sendCommand({ cmd: 'setFreezeTemp', tempF });
+  }, [sendCommand]);
+
   const activeDevice = useMemo(
     () => devices.find((d) => d.mac === activeMac) ?? null,
     [devices, activeMac]
@@ -2307,6 +2467,10 @@ function PoolProvider({ children }: { children: React.ReactNode }) {
     toggleSchedule: toggleScheduleFn,
     r2Depends,
     setRelay2Dependency: setRelay2DependencyFn,
+    freezeInfo,
+    setRelayFreeze: setRelayFreezeFn,
+    setPumpFreeze: setPumpFreezeFn,
+    setFreezeTemp: setFreezeTempFn,
   };
 
   return <PoolContext.Provider value={value}>{children}</PoolContext.Provider>;
@@ -2430,7 +2594,6 @@ function WheelPicker({ items, index, onChange, width, rows = WHEEL_ROWS }: {
 }
 const WHEEL_H12 = Array.from({ length: 12 }, (_, i) => String(i + 1));
 const WHEEL_M60 = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0'));
-const WHEEL_H24 = Array.from({ length: 24 }, (_, i) => String(i));
 
 // ============================================================
 //  SLIDE-UP MODAL — the native "slide" animation moves the dimmed
@@ -2525,7 +2688,9 @@ function NamePicker({ value, onChange, extraOptionsDisabled, forPump, defaultLab
                   slot carries no custom name. */}
               <PickerRow label={defaultLabel} selected={value === defaultLabel} onPress={() => { onChange(defaultLabel); setOpen(false); }} />
               {options.map((n) => {
-                const disabled = extraOptionsDisabled?.includes(n);
+                // usedNames includes THIS item's own name — never grey out
+                // the current selection as "(taken)" by itself.
+                const disabled = n !== value && extraOptionsDisabled?.includes(n);
                 return (
                   <PickerRow key={n} label={n} selected={value === n} disabled={disabled}
                     onPress={() => { if (!disabled) { onChange(n); setOpen(false); } }} />
@@ -2544,6 +2709,70 @@ function PickerRow({ label, selected, disabled, onPress }: { label: string; sele
         {label}{disabled ? '  (taken)' : ''}
       </Text>
     </TouchableOpacity>
+  );
+}
+
+// Freeze-protection panel used on every relay and pump card: a tinted
+// block that visibly changes state, a readable label + status line, and
+// (for pumps) a full-width freeze-speed button — replacing the earlier
+// 13px caption with a pencil glyph nobody could find or hit.
+function FreezeRow({ on, mainPump, onToggle, speedRpm, onEditSpeed }: {
+  on: boolean;
+  mainPump: boolean; // named MAIN PUMP — auto-enabled on naming, still switchable
+  onToggle: (v: boolean) => void;
+  speedRpm?: number | null;   // pumps only
+  onEditSpeed?: () => void;   // pumps only
+}) {
+  return (
+    <View
+      style={{
+        backgroundColor: on ? '#eff6ff' : '#f8fafc',
+        borderWidth: 1,
+        borderColor: on ? '#bfdbfe' : '#e2e8f0',
+        borderRadius: 12,
+        padding: 12,
+        marginTop: 8,
+      }}
+    >
+      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+        <Text style={{ fontSize: 20, marginRight: 10 }}>❄️</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 15, fontWeight: '700', color: '#1e293b' }}>Freeze Protection</Text>
+          <Text style={{ fontSize: 13, color: '#64748b', marginTop: 1 }}>
+            {on
+              ? mainPump ? 'On — auto-enabled for MAIN PUMP' : 'On — runs during freeze events'
+              : 'Off — not protected'}
+          </Text>
+        </View>
+        <Switch
+          value={on}
+          onValueChange={onToggle}
+          trackColor={{ false: '#cbd5e1', true: '#2563eb' }}
+          thumbColor="#ffffff"
+          ios_backgroundColor="#cbd5e1"
+        />
+      </View>
+      {on && speedRpm != null && onEditSpeed && (
+        <TouchableOpacity
+          onPress={onEditSpeed}
+          style={{
+            marginTop: 10,
+            flexDirection: 'row',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            backgroundColor: '#ffffff',
+            borderWidth: 1,
+            borderColor: '#bfdbfe',
+            borderRadius: 10,
+            paddingVertical: 11,
+            paddingHorizontal: 12,
+          }}
+        >
+          <Text style={{ fontSize: 14, color: '#334155', fontWeight: '600' }}>Freeze speed</Text>
+          <Text style={{ fontSize: 15, color: '#2563eb', fontWeight: '800' }}>{speedRpm} RPM  ›</Text>
+        </TouchableOpacity>
+      )}
+    </View>
   );
 }
 
@@ -2573,17 +2802,21 @@ function PumpTypePicker({ value, onChange, allowBlackDecker }: { value: PumpType
 // ============================================================
 //  HOME TAB — replica of web_ui.h / INDEX_HTML, backed by PoolContext
 // ============================================================
-function HomeScreen() {
+function HomeScreen({ onGoToDevice }: { onGoToDevice?: () => void }) {
   const {
     relays, pumps, presets, status, deviceLabel, activeDevice,
     setRelayMode, setRelayName, setPumpMode, setPumpConfig,
     addSchedule, updateSchedule, deleteSchedule, toggleSchedule,
     r2Depends, setRelay2Dependency,
+    freezeInfo, setRelayFreeze, setPumpFreeze,
   } = usePool();
 
   const [now, setNow] = useState(new Date());
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  // Freeze-speed prompt: enabling freeze protection on a pump asks what
+  // RPM it should run at during a freeze event.
+  const [freezePicker, setFreezePicker] = useState<{ pumpId: number; speed: string } | null>(null);
 
   const blink = useRef(new Animated.Value(1)).current;
   useEffect(() => {
@@ -2684,8 +2917,9 @@ function HomeScreen() {
     hour: '6',
     minute: '30',
     ampm: 'AM' as 'AM' | 'PM',
-    durH: '1',
-    durM: '0',
+    stopHour: '7',
+    stopMinute: '30',
+    stopAmpm: 'AM' as 'AM' | 'PM',
     enabled: true,
   };
   const [form, setForm] = useState(emptyForm);
@@ -2709,6 +2943,8 @@ function HomeScreen() {
   const openEdit = (p: Preset) => {
     setEditingId(p.id);
     const { hour, ampm } = to12Hour(p.hour24);
+    const stop = stopTimeOf(p.hour24, p.minute, p.durationMin);
+    const { hour: stopHour, ampm: stopAmpm } = to12Hour(stop.hour24);
     setForm({
       target: p.targetLabel,
       pumpType: p.pumpType,
@@ -2716,8 +2952,9 @@ function HomeScreen() {
       hour: String(hour),
       minute: String(p.minute).padStart(2, '0'),
       ampm,
-      durH: String(Math.floor(p.durationMin / 60)),
-      durM: String(p.durationMin % 60).padStart(2, '0'),
+      stopHour: String(stopHour),
+      stopMinute: String(stop.minute).padStart(2, '0'),
+      stopAmpm,
       enabled: p.enabled,
     });
     setModalOpen(true);
@@ -2726,7 +2963,15 @@ function HomeScreen() {
   const savePreset = () => {
     const hour24 = to24Hour(parseInt(form.hour, 10) || 12, form.ampm);
     const minute = parseInt(form.minute, 10) || 0;
-    const durationMin = (parseInt(form.durH, 10) || 0) * 60 + (parseInt(form.durM, 10) || 0);
+    const stopHour24 = to24Hour(parseInt(form.stopHour, 10) || 12, form.stopAmpm);
+    const stopMinute = parseInt(form.stopMinute, 10) || 0;
+    // The firmware stores start + duration; derive it from the two times. A
+    // stop "before" the start simply means the schedule runs past midnight.
+    const durationMin = (stopHour24 * 60 + stopMinute - (hour24 * 60 + minute) + 1440) % 1440;
+    if (durationMin < 1) {
+      Alert.alert('Stop time', 'Stop time must be different from the start time.');
+      return;
+    }
     // Speed/type belong to THE SCHEDULE (each preset runs its pump at its
     // own speed, as the web preset editor did) — not to the pump's manual
     // override config, which is what the old setPumpConfig call here set.
@@ -2746,9 +2991,19 @@ function HomeScreen() {
   };
 
   const isPumpTarget = form.target.startsWith('Pump');
+  const connected = status === 'connected';
+  const connecting = status === 'connecting' || status === 'authenticating';
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={{ paddingBottom: 32 }}>
+    <View style={{ flex: 1 }}>
+    {/* Everything is read-only-dimmed until a controller is connected:
+        edits made while disconnected were silently discarded and then
+        wiped by the first real state push — worse than blocking them. */}
+    <ScrollView
+      style={[styles.screen, !connected && { opacity: 0.35 }]}
+      contentContainerStyle={{ paddingBottom: 32 }}
+      pointerEvents={connected ? 'auto' : 'none'}
+    >
       {/* ---- Header ---- */}
       <Card style={styles.headerCard}>
         <View style={styles.chip}>
@@ -2765,6 +3020,17 @@ function HomeScreen() {
         </View>
         <Text style={styles.clock}>{clockStr}</Text>
         <Text style={styles.clockSub}>RELAY & PUMP TIMER</Text>
+        {freezeInfo?.active && (
+          <Text style={{ color: '#2563eb', fontWeight: '800', marginTop: 6 }}>
+            ❄ FREEZE PROTECTION ACTIVE
+            {freezeInfo.currentF != null ? ` · ${freezeInfo.currentF}°F` : ''}
+          </Text>
+        )}
+        {freezeInfo && !freezeInfo.sensorOk && (
+          <Text style={{ color: COLORS.danger, fontWeight: '700', marginTop: 6 }}>
+            Temperature sensor fault — freeze protection unavailable
+          </Text>
+        )}
       </Card>
 
       {/* ---- Relay cards ---- */}
@@ -2790,6 +3056,33 @@ function HomeScreen() {
             <View style={[styles.rTop, { marginBottom: 6 }]}>
               <Text style={{ color: COLORS.muted, fontSize: 13 }}>Depends on Relay 1</Text>
               <Switch value={r2Depends} onValueChange={setRelay2Dependency} />
+            </View>
+          )}
+          {/* Only offered when the connected firmware actually supports it
+              (it reports a freeze block in its state) — showing a toggle an
+              old firmware can only reject is a worse experience than none. */}
+          {freezeInfo && (
+            <View style={{ marginBottom: 8 }}>
+              <FreezeRow
+                on={r.freeze}
+                mainPump={r.name === 'MAIN PUMP'}
+                onToggle={(v) => {
+                  if (v) {
+                    setRelayFreeze(r.id, true); // arming protection is the safe direction
+                  } else {
+                    Alert.alert(
+                      'Turn off freeze protection?',
+                      r.name === 'MAIN PUMP'
+                        ? 'This is the MAIN PUMP — it is normally always freeze protected. It will NOT turn on automatically during freeze events.'
+                        : `${r.name} will NOT turn on automatically during freeze events.`,
+                      [
+                        { text: 'Cancel', style: 'cancel' },
+                        { text: 'Turn off', style: 'destructive', onPress: () => setRelayFreeze(r.id, false) },
+                      ]
+                    );
+                  }
+                }}
+              />
             </View>
           )}
           <Segmented value={r.mode} onChange={(m) => setRelayMode(r.id, m)} />
@@ -2869,7 +3162,15 @@ function HomeScreen() {
                   forPump
                 />
               </View>
-              <Text style={styles.pumpActual}>{p.active ? `${p.speedRpm} RPM` : '-- RPM'}</Text>
+              {/* Watts ride along for Pentair/Emaux (real readback); B&D is
+                  open-loop — no feedback — so it stays RPM-only. */}
+              <Text style={styles.pumpActual}>
+                {p.active
+                  ? p.watts != null && p.pumpType !== 'Black & Decker'
+                    ? `${p.speedRpm} RPM · ${p.watts} W`
+                    : `${p.speedRpm} RPM`
+                  : '-- RPM'}
+              </Text>
               <View style={styles.rCd}>
                 <Text style={{ color: COLORS.muted, fontSize: 13 }}>{p.countdown}</Text>
               </View>
@@ -2891,6 +3192,33 @@ function HomeScreen() {
                   setPumpMode(p.id, m);
                 }}
               />
+              {freezeInfo && (
+                <FreezeRow
+                  on={p.freeze}
+                  mainPump={p.name === 'MAIN PUMP'}
+                  onToggle={(v) => {
+                    if (v) {
+                      // Ask for the freeze speed before enabling.
+                      setFreezePicker({ pumpId: p.id, speed: String(p.freezeSpeed || 1200) });
+                    } else {
+                      // Removing protection is the most dangerous miss-click
+                      // of all — confirm before the pump loses its safeguard.
+                      Alert.alert(
+                        'Turn off freeze protection?',
+                        p.name === 'MAIN PUMP'
+                          ? 'This is the MAIN PUMP — it is normally always freeze protected. It will NOT run automatically during freeze events.'
+                          : `${p.name} will NOT run automatically during freeze events.`,
+                        [
+                          { text: 'Cancel', style: 'cancel' },
+                          { text: 'Turn off', style: 'destructive', onPress: () => setPumpFreeze(p.id, false, p.freezeSpeed) },
+                        ]
+                      );
+                    }
+                  }}
+                  speedRpm={p.freeze ? p.freezeSpeed || 1200 : null}
+                  onEditSpeed={() => setFreezePicker({ pumpId: p.id, speed: String(p.freezeSpeed || 1200) })}
+                />
+              )}
               {/* Visible only while a draft is open: Cancel closes it (even
                   with the pump running), tapping "On" reopens it. */}
               {draft && (
@@ -2946,7 +3274,12 @@ function HomeScreen() {
           <View key={p.id} style={[styles.pItem, !p.enabled && { opacity: 0.45 }]}>
             <Switch value={p.enabled} onValueChange={(v) => toggleSchedule(p.id, v)} />
             <View style={{ flex: 1, marginLeft: 12 }}>
-              <Text style={{ fontWeight: '700' }}>{p.timeStr} · +{p.durationStr}</Text>
+              <Text style={{ fontWeight: '700' }}>
+                {p.timeStr} – {(() => {
+                  const stop = stopTimeOf(p.hour24, p.minute, p.durationMin);
+                  return formatTimeStr(stop.hour24, stop.minute);
+                })()}
+              </Text>
               <Text style={{ color: COLORS.muted, fontSize: 13 }}>
                 {targetName(p.targetLabel)}
                 {p.targetLabel.startsWith('Pump') ? ` · ${p.pumpType} @ ${p.speedRpm} RPM` : ''}
@@ -2955,7 +3288,19 @@ function HomeScreen() {
             <TouchableOpacity style={styles.pBtn} onPress={() => openEdit(p)}>
               <FigIcon name="pencil" size={22} color={COLORS.text} />
             </TouchableOpacity>
-            <TouchableOpacity style={styles.pBtn} onPress={() => deleteSchedule(p.id)}>
+            <TouchableOpacity
+              style={styles.pBtn}
+              onPress={() =>
+                Alert.alert(
+                  'Delete schedule',
+                  `Delete the ${targetName(p.targetLabel)} schedule starting at ${p.timeStr}?`,
+                  [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Delete', style: 'destructive', onPress: () => deleteSchedule(p.id) },
+                  ]
+                )
+              }
+            >
               <FigIcon name="trash" size={22} color="#dc2626" />
             </TouchableOpacity>
           </View>
@@ -3069,24 +3414,32 @@ function HomeScreen() {
               )}
             </View>
 
-            <Text style={styles.fieldLabel}>Duration</Text>
-            <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 6 }}>
+            {/* A stop earlier than the start means the schedule runs past
+                midnight into the next day (the firmware's wrap semantics). */}
+            <Text style={styles.fieldLabel}>Stop Time</Text>
+            <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center' }}>
               <WheelPicker
-                width={56}
+                width={44}
                 rows={5}
-                items={WHEEL_H24}
-                index={Math.max(0, Math.min(23, parseInt(form.durH, 10) || 0))}
-                onChange={(i) => setForm((f) => ({ ...f, durH: WHEEL_H24[i] }))}
+                items={WHEEL_H12}
+                index={Math.max(0, Math.min(11, (parseInt(form.stopHour, 10) || 12) - 1))}
+                onChange={(i) => setForm((f) => ({ ...f, stopHour: WHEEL_H12[i] }))}
               />
-              <Text style={{ fontSize: 13, color: COLORS.muted }}>hours</Text>
+              <Text style={{ fontSize: 18, fontWeight: '700', color: COLORS.text }}>:</Text>
               <WheelPicker
-                width={56}
+                width={44}
                 rows={5}
                 items={WHEEL_M60}
-                index={Math.max(0, Math.min(59, parseInt(form.durM, 10) || 0))}
-                onChange={(i) => setForm((f) => ({ ...f, durM: WHEEL_M60[i] }))}
+                index={Math.max(0, Math.min(59, parseInt(form.stopMinute, 10) || 0))}
+                onChange={(i) => setForm((f) => ({ ...f, stopMinute: WHEEL_M60[i] }))}
               />
-              <Text style={{ fontSize: 13, color: COLORS.muted }}>min</Text>
+              <WheelPicker
+                width={48}
+                rows={5}
+                items={['AM', 'PM']}
+                index={form.stopAmpm === 'PM' ? 1 : 0}
+                onChange={(i) => setForm((f) => ({ ...f, stopAmpm: i === 1 ? 'PM' : 'AM' }))}
+              />
             </View>
 
             <View style={styles.rTop}>
@@ -3104,7 +3457,120 @@ function HomeScreen() {
             </View>
         </ScrollView>
       </SlideUpModal>
+
+      {/* ---- Freeze-speed prompt (opens when enabling pump freeze protection) ---- */}
+      <SlideUpModal visible={freezePicker != null} onClose={() => setFreezePicker(null)}>
+        {freezePicker != null && (() => {
+          const fp = pumps.find((pp) => pp.id === freezePicker.pumpId);
+          if (!fp) return null;
+          const range = fp.pumpType === 'Pentair' ? { min: 450, max: 3450 }
+            : fp.pumpType === 'Black & Decker' ? { min: 600, max: 3450 }
+            : { min: 800, max: 3400 };
+          const items: string[] = [];
+          for (let v = range.min; v <= range.max; v += 10) items.push(String(v));
+          const cur = Math.max(range.min, Math.min(range.max, parseInt(freezePicker.speed, 10) || 1200));
+          const idx = Math.round((cur - range.min) / 10);
+          return (
+            <View style={styles.pickerSheet}>
+              <Text style={styles.modalTitle}>Freeze speed — {fp.name}</Text>
+              <Text style={{ color: COLORS.muted, fontSize: 13, marginBottom: 8 }}>
+                RPM this pump runs at while freeze protection is active ({fp.pumpType}).
+              </Text>
+              <View style={{ alignItems: 'center' }}>
+                <WheelPicker
+                  width={90}
+                  rows={5}
+                  items={items}
+                  index={idx}
+                  onChange={(i) => setFreezePicker((s) => (s ? { ...s, speed: items[i] } : s))}
+                />
+              </View>
+              <View style={styles.modalActs}>
+                <TouchableOpacity style={[styles.btnSec, { flex: 1 }]} onPress={() => setFreezePicker(null)}>
+                  <Text style={styles.btnSecTxt}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.btnPrimary, { flex: 1 }]}
+                  onPress={() => {
+                    // Nothing is sent until this confirmation — the wheel
+                    // alone must never change what runs during a freeze.
+                    const changing = fp.freeze && fp.freezeSpeed > 0;
+                    Alert.alert(
+                      changing ? 'Change freeze speed?' : 'Enable freeze protection?',
+                      changing
+                        ? `${fp.name} will run at ${cur} RPM instead of ${fp.freezeSpeed} RPM during freeze events.`
+                        : `${fp.name} will automatically run at ${cur} RPM whenever freeze protection engages — even if switched off manually.`,
+                      [
+                        { text: 'Cancel', style: 'cancel' },
+                        {
+                          text: changing ? `Set ${cur} RPM` : 'Enable',
+                          onPress: () => {
+                            setPumpFreeze(freezePicker.pumpId, true, cur);
+                            setFreezePicker(null);
+                          },
+                        },
+                      ]
+                    );
+                  }}
+                >
+                  <Text style={styles.btnPrimaryTxt}>{fp.freeze && fp.freezeSpeed > 0 ? 'Save…' : 'Enable…'}</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          );
+        })()}
+      </SlideUpModal>
     </ScrollView>
+
+    {/* ---- Not-connected overlay: frosted layer + call to action ---- */}
+    {!connected && (
+      <View
+        style={{
+          position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+          backgroundColor: 'rgba(244,245,247,0.55)',
+          alignItems: 'center', justifyContent: 'center', padding: 28,
+        }}
+      >
+        <View
+          style={{
+            backgroundColor: '#ffffff', borderRadius: 18, padding: 24,
+            alignItems: 'center', width: '100%', maxWidth: 320,
+            shadowColor: '#000', shadowOpacity: 0.12, shadowRadius: 16,
+            shadowOffset: { width: 0, height: 6 }, elevation: 6,
+          }}
+        >
+          {connecting ? (
+            <>
+              <ActivityIndicator size="large" color={COLORS.on} style={{ marginBottom: 14 }} />
+              <Text style={{ fontSize: 17, fontWeight: '800', color: COLORS.text, marginBottom: 6 }}>
+                Connecting…
+              </Text>
+              <Text style={{ fontSize: 14, color: COLORS.muted, textAlign: 'center', lineHeight: 20 }}>
+                Hold on — establishing the link to your controller.
+              </Text>
+            </>
+          ) : (
+            <>
+              <Text style={{ fontSize: 34, marginBottom: 10 }}>📡</Text>
+              <Text style={{ fontSize: 17, fontWeight: '800', color: COLORS.text, marginBottom: 6 }}>
+                Not connected
+              </Text>
+              <Text style={{ fontSize: 14, color: COLORS.muted, textAlign: 'center', lineHeight: 20, marginBottom: 16 }}>
+                Connect to your controller first — pumps, relays and schedules can
+                only be viewed and changed while a device is connected.
+              </Text>
+              <TouchableOpacity
+                style={[styles.btnPrimary, { alignSelf: 'stretch' }]}
+                onPress={onGoToDevice}
+              >
+                <Text style={styles.btnPrimaryTxt}>Connect a device</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+      </View>
+    )}
+    </View>
   );
 }
 
@@ -4206,8 +4672,30 @@ function FirmwareUpdateModal({ visible, onClose }: { visible: boolean; onClose: 
 }
 
 function SettingsScreen() {
-  const { deviceFw, status } = usePool();
+  const { deviceFw, status, freezeInfo, setFreezeTemp } = usePool();
   const [updOpen, setUpdOpen] = useState(false);
+  const [frzOpen, setFrzOpen] = useState(false);
+  // The steppers edit a DRAFT — nothing is sent until the user confirms.
+  // An accidental tap must not silently move the auto-start temperature.
+  const [frzDraft, setFrzDraft] = useState<number | null>(null);
+
+  const bumpFreezeTemp = (d: number) => {
+    setFrzDraft((v) => (v == null ? v : Math.max(20, Math.min(60, v + d)))); // firmware bounds
+  };
+
+  const confirmFreezeTemp = () => {
+    if (frzDraft == null || !freezeInfo || frzDraft === freezeInfo.tempF) return;
+    Alert.alert(
+      'Change freeze temperature?',
+      `Freeze protection will engage at ${frzDraft}°F instead of ${freezeInfo.tempF}°F` +
+        ` (releasing at ${frzDraft + 2}°F). This changes when protected pumps and` +
+        ' relays start automatically.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: `Set to ${frzDraft}°F`, onPress: () => setFreezeTemp(frzDraft) },
+      ]
+    );
+  };
 
   return (
     <ScrollView style={[styles.screen, { backgroundColor: FIG.white }]} contentContainerStyle={{ paddingBottom: 40 }}>
@@ -4240,7 +4728,96 @@ function SettingsScreen() {
         </TouchableOpacity>
       </View>
 
+      <Text style={figSection}>Freeze Protection</Text>
+      <View style={figCard}>
+        <TouchableOpacity
+          onPress={() => { setFrzDraft(freezeInfo?.tempF ?? null); setFrzOpen(true); }}
+          style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 13 }}
+        >
+          <Text style={{ fontSize: 18 }}>❄</Text>
+          <Text style={{ fontSize: 15, fontWeight: '500', color: FIG.text, flex: 1 }}>Freeze Protection</Text>
+          <Text style={{ fontSize: 15, fontWeight: '700', color: freezeInfo?.active ? '#2563eb' : freezeInfo ? FIG.green : FIG.muted }}>
+            {freezeInfo ? (freezeInfo.active ? 'ACTIVE' : `${freezeInfo.tempF}°F`) : '—'}
+          </Text>
+          <FigIcon name="chevronRight" size={18} color={FIG.muted} />
+        </TouchableOpacity>
+      </View>
+
       <FirmwareUpdateModal visible={updOpen} onClose={() => setUpdOpen(false)} />
+
+      {/* ---- Freeze Protection panel ---- */}
+      <SlideUpModal visible={frzOpen} onClose={() => setFrzOpen(false)}>
+        <View style={styles.pickerSheet}>
+          <Text style={styles.modalTitle}>❄ Freeze Protection</Text>
+
+          {!freezeInfo && (
+            <Text style={{ fontSize: 13, color: FIG.muted, lineHeight: 19, marginBottom: 10 }}>
+              {status === 'connected'
+                ? "This controller's firmware doesn't support freeze protection yet — update it from the Firmware section above."
+                : 'Connect to a controller to configure freeze protection.'}
+            </Text>
+          )}
+
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <Text style={{ fontSize: 14, color: FIG.muted, fontWeight: '600' }}>Current temperature</Text>
+            <Text style={{ fontSize: 16, fontWeight: '800', color: freezeInfo?.active ? '#2563eb' : FIG.text }}>
+              {freezeInfo
+                ? freezeInfo.sensorOk && freezeInfo.currentF != null
+                  ? `${freezeInfo.currentF}°F`
+                  : 'Sensor fault'
+                : '—'}
+            </Text>
+          </View>
+          {freezeInfo?.active && (
+            <Text style={{ color: '#2563eb', fontWeight: '700', marginBottom: 10 }}>
+              ❄ Freeze protection is ACTIVE — protected pumps and relays are running
+            </Text>
+          )}
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Text style={{ fontSize: 14, color: FIG.muted, fontWeight: '600' }}>Freeze temperature</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+              <TouchableOpacity
+                onPress={() => bumpFreezeTemp(-1)}
+                style={{ width: 34, height: 34, borderRadius: 17, borderWidth: 1, borderColor: FIG.border, alignItems: 'center', justifyContent: 'center' }}
+              >
+                <Text style={{ fontSize: 18, fontWeight: '700', color: FIG.text }}>−</Text>
+              </TouchableOpacity>
+              <Text style={{ fontSize: 16, fontWeight: '800', color: FIG.text, minWidth: 44, textAlign: 'center' }}>
+                {frzDraft != null ? `${frzDraft}°F` : freezeInfo ? `${freezeInfo.tempF}°F` : '—'}
+              </Text>
+              <TouchableOpacity
+                onPress={() => bumpFreezeTemp(1)}
+                style={{ width: 34, height: 34, borderRadius: 17, borderWidth: 1, borderColor: FIG.border, alignItems: 'center', justifyContent: 'center' }}
+              >
+                <Text style={{ fontSize: 18, fontWeight: '700', color: FIG.text }}>＋</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+          <Text style={{ fontSize: 12, color: FIG.muted, marginTop: 8, lineHeight: 17 }}>
+            Engages after the temperature stays at or below this for 30 seconds; releases
+            2°F above it. Protected pumps and relays run even if switched off manually.
+            Per-pump and per-relay freeze toggles are on the Home tab.
+          </Text>
+
+          {frzDraft != null && freezeInfo && frzDraft !== freezeInfo.tempF ? (
+            <>
+              <TouchableOpacity style={[styles.btnPrimary, { marginTop: 16 }]} onPress={confirmFreezeTemp}>
+                <Text style={styles.btnPrimaryTxt}>Save {frzDraft}°F…</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.btnSec, { marginTop: 8 }]}
+                onPress={() => { setFrzDraft(freezeInfo.tempF); }}
+              >
+                <Text style={styles.btnSecTxt}>Discard change</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <TouchableOpacity style={[styles.btnPrimary, { marginTop: 16 }]} onPress={() => setFrzOpen(false)}>
+              <Text style={styles.btnPrimaryTxt}>Done</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </SlideUpModal>
     </ScrollView>
   );
 }
@@ -4316,7 +4893,7 @@ export default function App() {
       <SafeAreaView style={styles.root}>
         <StatusBar barStyle="dark-content" backgroundColor={COLORS.bg} />
         <View style={{ flex: 1 }}>
-          {tab === 'home' && <HomeScreen />}
+          {tab === 'home' && <HomeScreen onGoToDevice={() => setTab('device')} />}
           {tab === 'device' && <DeviceScreen onPairingComplete={() => setTab('home')} />}
           {tab === 'settings' && <SettingsScreen />}
           <AutoUpdatePrompt />

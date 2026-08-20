@@ -2,7 +2,7 @@
 // reported by the running device) against the GitHub manifest to decide
 // whether to offer an OTA update, and the manifest's "version" must match
 // this string exactly or the update loop never settles.
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.0.3"
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -44,7 +44,14 @@
 #define RELAY2_ACTIVE_HIGH false
 #define RELAY3_ACTIVE_HIGH false // <-- New  
 
-#define IDLE_TIMEOUT_MS 20000UL 
+#define IDLE_TIMEOUT_MS 20000UL
+
+// ---- Freeze protection thermistor (10k NTC + 10k series divider) ----
+#define THERMISTOR_PIN        5        // ADC1 pin — safe alongside Wi-Fi
+#define THERM_NOMINAL_RES     10000.0f // resistance at 25°C
+#define THERM_NOMINAL_TEMP_C  25.0f
+#define THERM_B_COEFF         3950.0f
+#define THERM_SERIES_RES      10000.0f // fixed divider resistor
 // -----------------------------------------------
 
 #if DISPLAY_TYPE
@@ -92,12 +99,12 @@ Btn getButton() {
   return BTN_NONE;
 }
 
-enum AppState { ST_HOME, ST_MENU, ST_PRESET_LIST, ST_PRESET_EDIT, ST_MANUAL, ST_SET_TIME, ST_SETTINGS };
+enum AppState { ST_HOME, ST_MENU, ST_PRESET_LIST, ST_PRESET_EDIT, ST_MANUAL, ST_SET_TIME, ST_FREEZE, ST_SETTINGS };
 AppState state = ST_HOME;
 int homePage = 0; // 0 = relay status, 1 = pump status (toggle with UP/DOWN while at Home)
 
-const char* menuItems[] = {"View Presets", "Add Preset", "Manual Control", "Set Time", "Settings"};
-#define MENU_COUNT 5
+const char* menuItems[] = {"View Presets", "Add Preset", "Manual Control", "Set Time", "Freeze Protection", "Settings"};
+#define MENU_COUNT 6
 #define MENU_VISIBLE 4 // Maximum number of items visible on screen at once
 int menuIndex = 0;
 int menuScroll = 0;    // NEW: Tracks the current scroll position of the menu
@@ -145,7 +152,11 @@ int manualScroll = 0;
 bool manualEditingSpeed = false; // true while UP/DOWN adjust speed instead of moving the cursor
 
 uint8_t setHourTemp = 0, setMinuteTemp = 0;
-int timeFieldCursor = 0; 
+int timeFieldCursor = 0;
+
+// Freeze-temp edit draft: UP/DOWN change this, ENTER commits it (the
+// stored value only moves on an explicit save — no accidental changes).
+int16_t freezeTempDraft = 34;
 
 unsigned long lastInteractionMs = 0;
 bool needRedraw = true;
@@ -166,6 +177,8 @@ void setup() {
   pinMode(PIN_RELAY1, OUTPUT);
   pinMode(PIN_RELAY2, OUTPUT);
   pinMode(PIN_RELAY3, OUTPUT);
+
+  analogReadResolution(12); // freeze-protection thermistor ADC (0-4095)
   
   setRelay1(false);
   setRelay2(false);
@@ -209,6 +222,8 @@ void loop() {
 
   rtcResync(); // no-op most ticks; periodically re-aligns against the DS3231
   rtcServicePendingWrite(); // flushes an app setTime's RTC write on the loop task
+
+  freezeTick(); // 1s thermistor sample + freeze-protection state machine
 
   // App connectivity: Wi-Fi state machine (starts the HTTP API when the
   // network comes up), BLE auth deadlines, and state broadcasts to any
@@ -309,6 +324,14 @@ void handleSerialCommand() {
     return;
   }
   if (tok[0] == "status") { serialPrintPumpStatus(); return; }
+  if (tok[0] == "temp") {
+    bool fa, fok; float ft;
+    freezeStatusGet(fa, ft, fok);
+    if (fok) Serial.printf("Temp: %.1fF (threshold %dF) — freeze protection %s\n",
+                           ft, (int)freezeTempFGet(), fa ? "ACTIVE" : "idle");
+    else Serial.println("Temp: SENSOR FAULT (check the thermistor divider on GPIO 5)");
+    return;
+  }
   if (tok[0] == "debug" && nTok >= 2) { rs485SetDebug(tok[1] == "on"); return; }
 
   if (tok[0] != "pump" || nTok < 3) {
@@ -388,6 +411,61 @@ void setRelay1(bool on) { writeRelay(PIN_RELAY1, on, RELAY1_ACTIVE_HIGH); }
 void setRelay2(bool on) { writeRelay(PIN_RELAY2, on, RELAY2_ACTIVE_HIGH); }
 void setRelay3(bool on) { writeRelay(PIN_RELAY3, on, RELAY3_ACTIVE_HIGH); }
 
+// ============================================================
+//  FREEZE PROTECTION  (10k NTC on GPIO 5)
+//  Reading <= freezeTempF for 30s straight -> engage; release once the
+//  temperature climbs to threshold + 2°F (hysteresis so it can't rapidly
+//  cycle at the boundary). A sensor fault — implausible reading from an
+//  open/shorted divider — never triggers protection and drops an active
+//  one; the app shows the fault so it can't go unnoticed.
+// ============================================================
+float thermistorReadF() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogRead(THERMISTOR_PIN); // average ADC noise out
+  int adc = (int)(sum / 8);
+  if (adc < 1) adc = 1;
+  if (adc > 4094) adc = 4094; // railed = open/shorted; the range check flags it
+
+  float resistance = THERM_SERIES_RES * (4095.0f / (float)adc - 1.0f);
+  float kelvin = resistance / THERM_NOMINAL_RES;
+  kelvin = log(kelvin);
+  kelvin /= THERM_B_COEFF;
+  kelvin += 1.0f / (THERM_NOMINAL_TEMP_C + 273.15f);
+  kelvin = 1.0f / kelvin;
+  return (kelvin - 273.15f) * 9.0f / 5.0f + 32.0f;
+}
+
+void freezeTick() {
+  static unsigned long lastSampleMs = 0;
+  static unsigned long belowSinceMs = 0;
+  static bool active = false;
+  if (millis() - lastSampleMs < 1000) return;
+  lastSampleMs = millis();
+
+  float tempF = thermistorReadF();
+  bool ok = (tempF > -40.0f && tempF < 150.0f);
+  int16_t thresh = freezeTempFGet();
+
+  if (!ok) {
+    belowSinceMs = 0;
+    if (active) Serial.println("[freeze] sensor fault — protection released");
+    active = false;
+  } else if (tempF <= (float)thresh) {
+    if (belowSinceMs == 0) belowSinceMs = millis();
+    if (!active && millis() - belowSinceMs >= 30000UL) {
+      active = true;
+      Serial.printf("[freeze] ENGAGED: %.1fF held at/below %dF for 30s\n", tempF, thresh);
+    }
+  } else {
+    belowSinceMs = 0;
+    if (active && tempF >= (float)(thresh + 2)) {
+      active = false;
+      Serial.printf("[freeze] released: %.1fF reached %dF\n", tempF, thresh + 2);
+    }
+  }
+  freezeStatusSet(active, tempF, ok);
+}
+
 void updateOutputs() {
   uint8_t ch, cm, cs; clockGet(ch, cm, cs);
   int curMin = (int)ch * 60 + cm;
@@ -397,10 +475,16 @@ void updateOutputs() {
   uint16_t pumpWantsSpeed[MAX_PUMPS] = {0};
   uint8_t pumpWantsType[MAX_PUMPS] = {0};
 
-  for (int i = 0; i < MAX_PRESETS; i++) {
+  // No trusted time source yet (fresh boot with no RTC, or a dead RTC
+  // battery's fabricated 12:00 seed): AUTO schedules must not fire against
+  // a wrong wall clock — a 10:00 pump schedule would start the moment such
+  // a board boots. Wants stay false; manual ON/OFF still works. The gate
+  // lifts as soon as the RTC (battery-backed) or the app sets real time.
+  bool timeTrusted = clockWasSet();
+  for (int i = 0; timeTrusted && i < MAX_PRESETS; i++) {
     Preset p;
     if (!presetGet(i, p) || !p.used || !p.enabled) continue;
-    
+
     if (isWithinSchedule(p, curMin)) {
       if (p.target == TGT_RELAY1) r1Wants = true;
       else if (p.target == TGT_RELAY2) r2Wants = true;
@@ -420,7 +504,18 @@ void updateOutputs() {
   bool r2On = (m2 == MODE_ON) ? true : ((m2 == MODE_OFF) ? false : (r2Wants && (!relay2DependencyGet() || r1On)));
   bool r3On = (m3 == MODE_ON) ? true : ((m3 == MODE_OFF) ? false : r3Wants); // Completely independent
 
-  setRelay1(r1On); 
+  // Freeze protection overrides EVERYTHING — manual OFF and the R2
+  // dependency included: keeping water moving outranks user preference
+  // for as long as the event lasts.
+  bool frzActive; float frzTemp; bool frzOk;
+  freezeStatusGet(frzActive, frzTemp, frzOk);
+  if (frzActive) {
+    if (relayFreezeGet(1)) r1On = true;
+    if (relayFreezeGet(2)) r2On = true;
+    if (relayFreezeGet(3)) r3On = true;
+  }
+
+  setRelay1(r1On);
   setRelay2(r2On);
   setRelay3(r3On);
   relayActualStatesPublish(r1On, r2On, r3On);
@@ -448,6 +543,20 @@ void updateOutputs() {
       typeFinal = pumpWantsType[i];
     }
 
+    // Freeze protection: a protected pump runs at its freeze speed no
+    // matter what mode/schedule said, driven with its configured protocol.
+    if (frzActive) {
+      bool fEn; uint16_t fSpd;
+      pumpFreezeGet(pumpNum, fEn, fSpd);
+      if (fEn && fSpd > 0) {
+        uint16_t ms; uint8_t mt;
+        pumpManualParamsGet(pumpNum, ms, mt);
+        runFinal = true;
+        speedFinal = fSpd;
+        typeFinal = mt;
+      }
+    }
+
     updatePumpPhysicalState(pumpNum, typeFinal, runFinal, speedFinal);
   }
 }
@@ -456,13 +565,31 @@ void updateOutputs() {
 // ============================================================
 
 void handleSettings(Btn b) {
-  if (b == BTN_BACK || b == BTN_ENTER) { 
-    state = ST_MENU; 
-    return; 
+  if (b == BTN_BACK || b == BTN_ENTER) {
+    state = ST_MENU;
+    return;
   }
   if (b == BTN_UP || b == BTN_DOWN) {
     relay2DependencySet(!relay2DependencyGet());
   }
+}
+
+void handleFreeze(Btn b) {
+  if (b == BTN_BACK) { // discard the draft — nothing changes
+    state = ST_MENU;
+    return;
+  }
+  if (b == BTN_ENTER) { // the explicit confirmation: commit + persist
+    if (freezeTempDraft != freezeTempFGet()) {
+      freezeTempFSet(freezeTempDraft);
+      showMessage("Freeze temp saved");
+    }
+    state = ST_MENU;
+    return;
+  }
+  // Same 20-60°F bounds the app enforces.
+  if (b == BTN_UP   && freezeTempDraft < 60) freezeTempDraft++;
+  if (b == BTN_DOWN && freezeTempDraft > 20) freezeTempDraft--;
 }
 
 
@@ -474,6 +601,7 @@ void handleButton(Btn b) {
     case ST_PRESET_EDIT: handlePresetEdit(b); break;
     case ST_MANUAL:      handleManual(b); break;
     case ST_SET_TIME:    handleSetTime(b); break;
+    case ST_FREEZE:      handleFreeze(b); break;
     case ST_SETTINGS:    handleSettings(b); break;
   }
 }
@@ -517,7 +645,8 @@ void handleMenu(Btn b) {
       case 1: enterAddPreset(); break;
       case 2: enterManualControl(); break;
       case 3: enterSetTime(); break;
-      case 4: state = ST_SETTINGS; break;
+      case 4: freezeTempDraft = freezeTempFGet(); state = ST_FREEZE; break;
+      case 5: state = ST_SETTINGS; break;
     }
   }
 }
@@ -813,6 +942,30 @@ void showMessage(const char* m) {
 //  DRAWING
 // ============================================================
 
+void drawFreeze() {
+  display.setCursor(0, 0);
+  display.print("Freeze Protection");
+  display.drawFastHLine(0, 9, 128, COLOR_WHITE);
+
+  bool fa, fok; float ft;
+  freezeStatusGet(fa, ft, fok);
+  display.setCursor(0, 14);
+  if (fok) display.printf("Now: %.1fF%s", ft, fa ? "  ACTIVE!" : "");
+  else     display.print("Now: SENSOR FAULT");
+
+  display.fillRect(0, 26, 128, 11, COLOR_WHITE);
+  display.setTextColor(COLOR_BLACK);
+  display.setCursor(4, 28);
+  bool unsaved = (freezeTempDraft != freezeTempFGet());
+  display.printf("Freeze temp: %dF%s", (int)freezeTempDraft, unsaved ? " *" : "");
+  display.setTextColor(COLOR_WHITE);
+
+  display.setCursor(0, 44);
+  display.printf("Releases at %dF", (int)freezeTempDraft + 2);
+  display.setCursor(0, 56);
+  display.print(unsaved ? "ENT:Save BACK:Cancel" : "UP/DN:Adjust BACK:OK");
+}
+
 void drawSettings() {
   display.setCursor(0, 0);
   display.print("Settings");
@@ -843,6 +996,7 @@ void drawScreen() {
     case ST_PRESET_EDIT:  drawPresetEdit(); break;
     case ST_MANUAL:       drawManual(); break;
     case ST_SET_TIME:     drawSetTime(); break;
+    case ST_FREEZE:       drawFreeze(); break;
     case ST_SETTINGS:     drawSettings(); break;
   }
   display.display();

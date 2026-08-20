@@ -92,6 +92,7 @@ inline void dbgHexDump(const uint8_t *buf, uint8_t len) {
 #define VERIFY_RESEND_MS    5000  // re-send the command if still not matching
 #define VERIFY_RPM_TOL      50    // regulation jitter allowance on the readback
 #define VERIFY_MAX_RESENDS  5     // then give up until the goal changes
+#define WATTS_POLL_MS       15000 // power readback cadence while confirmed running (Pentair/Emaux)
 
 // ---- Pentair IntelliFlo VS/VF (proprietary RS485) ----------
 #define PENTAIR_CTRL_ADDR     0x10  // us, the automation controller
@@ -112,6 +113,7 @@ inline void dbgHexDump(const uint8_t *buf, uint8_t len) {
 #define EMAUX_REG_RUN        0x0008
 #define EMAUX_REG_SPEED      0x0009
 #define EMAUX_REG_CUR_SPEED  0x0001  // input reg: current speed (RPM)
+#define EMAUX_REG_CUR_POWER  0x0002  // input reg: current power (W) — UNCONFIRMED: check the value against the pump's own display
 #define EMAUX_REG_RUN_STATUS 0x0003  // input reg: 1 = running, 0 = stopped
 #define EMAUX_RUN_CMD      1
 #define EMAUX_STOP_CMD     2
@@ -139,6 +141,7 @@ inline void dbgHexDump(const uint8_t *buf, uint8_t len) {
 struct PumpState {
     bool active = false;
     uint16_t speed = 0;
+    uint16_t watts = 0;           // last power readback; 0 = stopped/unknown (B&D: always 0, no feedback)
     uint8_t  type = PUMP_PENTAIR; // protocol this pump was last driven with
 };
 PumpState currentPumpStates[MAX_PUMPS];
@@ -399,7 +402,7 @@ inline bool pentairRun(uint8_t pumpId, bool run) {
 
 // Status readback: payload is [run mode drivestate watts_hi watts_lo
 // rpm_hi rpm_lo ...] — run==0x0A means running.
-inline bool pentairReadStatus(uint8_t pumpId, bool &running, uint16_t &rpm) {
+inline bool pentairReadStatus(uint8_t pumpId, bool &running, uint16_t &rpm, uint16_t &watts) {
     rs485UseBaud(RS485_BAUD);
     uint8_t frame[32];
     uint8_t flen = pentairBuildPacket(frame, pentairBusAddress(pumpId), PENTAIR_CMD_STATUS, nullptr, 0);
@@ -415,8 +418,9 @@ inline bool pentairReadStatus(uint8_t pumpId, bool &running, uint16_t &rpm) {
     if (dataLen < 7) { DBG_PRINTLN("[Pentair] status payload too short"); return false; }
     const uint8_t *d = resp + sof + 6;
     running = (d[0] == PENTAIR_RUN);
+    watts = ((uint16_t)d[3] << 8) | d[4];
     rpm = ((uint16_t)d[5] << 8) | d[6];
-    DBG_PRINTF("[Pentair] pump %u status: %s @ %u rpm\n", pumpId, running ? "RUNNING" : "stopped", rpm);
+    DBG_PRINTF("[Pentair] pump %u status: %s @ %u rpm, %u W\n", pumpId, running ? "RUNNING" : "stopped", rpm, watts);
     return true;
 }
 
@@ -559,18 +563,21 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
     if (pumpId < 1 || pumpId > MAX_PUMPS) return;
     int idx = pumpId - 1;
 
-    // Commanding OFF uses the protocol the pump was actually last driven
-    // with — a stop frame in the wrong protocol never lands.
-    if (!run) pumpType = currentPumpStates[idx].type;
-
-    bool alreadyApplied = (currentPumpStates[idx].active == run) &&
-                          (!run || currentPumpStates[idx].speed == speed);
-    // A flag already applied on echo may still have its readback
-    // correction loop running — fall through for it in that case.
-    if (alreadyApplied && !pumpVerify[idx].awaiting) return;
-
-    // Print-on-change bookkeeping.
+    // Print-on-change bookkeeping. Goal-change detection runs BEFORE the
+    // applied-state shortcut below: after a verify give-up the state can
+    // LOOK applied (active=false at window end matches run=false) while the
+    // goal changed — taking the shortcut there swallowed the schedule-end
+    // stop and left gaveUp latched, killing identical future windows.
     PumpLogMemo &memo = pumpLogMemo[idx];
+
+    // Commanding OFF uses the protocol the pump was actually last driven
+    // with — a stop frame in the wrong protocol never lands. If the run
+    // was never confirmed (verify gave up), fall back to the goal type
+    // those attempts used: the pump may still be acting on them.
+    if (!run) pumpType = (currentPumpStates[idx].active || !memo.haveDesired)
+                           ? currentPumpStates[idx].type
+                           : memo.type;
+
     bool desiredChanged = !memo.haveDesired || memo.run != run ||
                           memo.speed != speed || memo.type != pumpType;
     if (desiredChanged) {
@@ -579,6 +586,30 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
         memo.speed = speed;
         memo.type = pumpType;
         memo.failLogged = false;
+    }
+
+    bool alreadyApplied = (currentPumpStates[idx].active == run) &&
+                          (!run || currentPumpStates[idx].speed == speed);
+    // A flag already applied on echo may still have its readback
+    // correction loop running — fall through for it in that case.
+    if (!desiredChanged && alreadyApplied && !pumpVerify[idx].awaiting) {
+        // Live power readback while confirmed running. Pentair/Emaux only —
+        // Black & Decker has no feedback channel at all. Deliberately does
+        // NOT touch .speed: rewriting it from a readback would unsettle the
+        // alreadyApplied comparison and re-trigger the verify loop.
+        static uint32_t lastWattsPollMs[MAX_PUMPS] = {0, 0, 0, 0};
+        if (run && pumpType != PUMP_BLACKDECKER &&
+            millis() - lastWattsPollMs[idx] >= WATTS_POLL_MS) {
+            lastWattsPollMs[idx] = millis();
+            if (pumpType == PUMP_PENTAIR) {
+                bool r; uint16_t rrpm, w;
+                if (pentairReadStatus(pumpId, r, rrpm, w)) currentPumpStates[idx].watts = w;
+            } else { // PUMP_EMAUX
+                int32_t w = emauxReadInputRegister(pumpId, EMAUX_REG_CUR_POWER);
+                if (w >= 0 && w <= 5000) currentPumpStates[idx].watts = (uint16_t)w;
+            }
+        }
+        return;
     }
 
     // Black & Decker is pump-1-only (fixed bus address 1).
@@ -725,9 +756,10 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
     bool gotReport = false;
     bool match = false;
     uint16_t reported = 0;
+    uint16_t wattsRead = 0;
     if (pumpType == PUMP_PENTAIR) {
         bool pRunning; uint16_t pRpm;
-        if (pentairReadStatus(pumpId, pRunning, pRpm)) {
+        if (pentairReadStatus(pumpId, pRunning, pRpm, wattsRead)) {
             gotReport = true;
             reported = pRpm;
             if (run) {
@@ -766,6 +798,15 @@ inline void updatePumpPhysicalState(uint8_t pumpId, uint8_t pumpType, bool run, 
         // THE confirmation: the pump itself reports the commanded state.
         currentPumpStates[idx].active = run;
         currentPumpStates[idx].speed = run ? target : 0;
+        currentPumpStates[idx].watts = 0;
+        if (run) {
+            if (pumpType == PUMP_PENTAIR) {
+                currentPumpStates[idx].watts = wattsRead; // rode along in the status frame
+            } else { // PUMP_EMAUX — one extra register read, only on confirm
+                int32_t w = emauxReadInputRegister(pumpId, EMAUX_REG_CUR_POWER);
+                if (w >= 0 && w <= 5000) currentPumpStates[idx].watts = (uint16_t)w;
+            }
+        }
         if (run) currentPumpStates[idx].type = pumpType;
         markDirty(); // announce the flip to the app right away
         ver.awaiting = false;
@@ -801,4 +842,9 @@ inline void pumpActualStateGet(uint8_t pumpId, bool &active, uint16_t &speed) {
     if (pumpId < 1 || pumpId > MAX_PUMPS) { active = false; speed = 0; return; }
     active = currentPumpStates[pumpId - 1].active;
     speed  = currentPumpStates[pumpId - 1].speed;
+}
+
+inline uint16_t pumpActualWattsGet(uint8_t pumpId) {
+    if (pumpId < 1 || pumpId > MAX_PUMPS) return 0;
+    return currentPumpStates[pumpId - 1].watts;
 }
